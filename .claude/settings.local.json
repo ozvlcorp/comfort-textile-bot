@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(\"D:\\\\projects\\\\TX ELECTRONICS\\\\webapp\\\\.env.local\" << 'EOF'\n# Demo mode - works without backend\nVITE_API_URL=http://localhost:4000\nVITE_USE_MOCK_DATA=true\nEOF)",
+      "Bash(npx tsc:*)",
+      "Bash(node -e \"const {createRequire}=require\\(''module''\\);const req=createRequire\\(import.meta.url??''file:///x.js''\\);try{const p=req\\(''pdfmake/src/printer''\\);console.log\\(''printer ok'',typeof p\\);}catch\\(e\\){console.log\\(''error:'',e.message\\)}\")",
+      "Bash(node:*)",
+      "Bash(ls:*)",
+      "Bash(file:*)",
+      "Bash(npm uninstall:*)",
+      "Bash(start:*)"
+    ]
+  }
+}
