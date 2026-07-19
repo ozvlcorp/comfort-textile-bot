@@ -69,7 +69,7 @@ export function registerApiRoutes(server: FastifyInstance) {
     }
 
     const user = await prisma.user.findUnique({ where: { telegramId } });
-    if (!user || !user.phoneNumber || !user.moskladCounterpartyId) {
+        if (!user || !user.phoneNumber) {
       return { isRegistered: false, language: user?.language || "uz" };
     }
 
