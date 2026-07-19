@@ -73,6 +73,10 @@ export function registerApiRoutes(server: FastifyInstance) {
       return { isRegistered: false, language: user?.language || "uz" };
     }
 
+    if (!user.moskladCounterpartyId) {
+      return { isRegistered: true, language: user.language || "uz", balance: 0, balanceCurrency: null, firstName: user.firstName, phoneNumber: user.phoneNumber, counterpartyName: null, defaultLat: null, defaultLng: null, defaultAddressText: null, defaultAddressExtra: null };
+    }
+
     try {
       const [balance, balanceCurrency, counterparty] = await Promise.all([
         getCustomerBalance(user.moskladCounterpartyId),
