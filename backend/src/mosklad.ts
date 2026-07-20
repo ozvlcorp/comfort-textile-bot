@@ -518,7 +518,7 @@ export async function getUsdRate(): Promise<number | null> {
 // every new order picks up the current rate almost immediately.
 let _uzsCurrencyCache: { href: string; uzsPerUsd: number; expiresAt: number } | null = null;
 
-async function getUzsCurrencyInfo(): Promise<{ href: string; uzsPerUsd: number } | null> {
+export async function getUzsCurrencyInfo(): Promise<{ href: string; uzsPerUsd: number } | null> {
   const now = Date.now();
   if (_uzsCurrencyCache && _uzsCurrencyCache.expiresAt > now) {
     return { href: _uzsCurrencyCache.href, uzsPerUsd: _uzsCurrencyCache.uzsPerUsd };
@@ -748,7 +748,8 @@ export async function createCustomerOrder(
       }
     },
     positions,
-    shipmentAddress: deliveryInfo.addressText || undefined
+    shipmentAddress: deliveryInfo.addressText || undefined,
+    ...(trimmedNote ? { description: trimmedNote } : {})
   };
 
   const orderLocationAttr = process.env.MOSKLAD_ORDER_LOCATION_ATTR;
@@ -882,7 +883,8 @@ export async function createDemand(
       }
     },
     positions,
-    shipmentAddress: deliveryInfo.addressText || undefined
+    shipmentAddress: deliveryInfo.addressText || undefined,
+    ...(trimmedNote ? { description: trimmedNote } : {})
   };
 
   const orderLocationAttr = process.env.MOSKLAD_ORDER_LOCATION_ATTR;
