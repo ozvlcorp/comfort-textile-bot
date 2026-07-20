@@ -229,6 +229,9 @@ export function registerApiRoutes(server: FastifyInstance) {
 
     const products = await getProductsByIds(body.items.map((item) => item.id));
     const productMap = new Map(products.map((product) => [product.id, product]));
+    // Sale-price currency per product (USD/UZS) — needed to convert order sums
+    // into the order document currency in createCustomerOrder.
+    const priceCurrencyById = new Map(products.map((product) => [product.id, product.priceCurrency ?? null]));
 
     const items = body.items
       .map((item) => {
@@ -291,7 +294,7 @@ export function registerApiRoutes(server: FastifyInstance) {
           user.firstName || undefined,
           user.username || undefined
         );
-        const order = await createCustomerOrder(counterpartyId, items.map((i) => ({ id: i.productId, quantity: i.quantity, price: i.price / 100 })), {
+        const order = await createCustomerOrder(counterpartyId, items.map((i) => ({ id: i.productId, quantity: i.quantity, price: i.price / 100, currency: priceCurrencyById.get(i.productId) ?? null })), {
           deliveryMethod: "pickup",
           orderNote
         });
@@ -327,7 +330,7 @@ export function registerApiRoutes(server: FastifyInstance) {
           user.firstName || undefined,
           user.username || undefined
         );
-        const order = await createCustomerOrder(counterpartyId, items.map((i) => ({ id: i.productId, quantity: i.quantity, price: i.price / 100 })), {
+        const order = await createCustomerOrder(counterpartyId, items.map((i) => ({ id: i.productId, quantity: i.quantity, price: i.price / 100, currency: priceCurrencyById.get(i.productId) ?? null })), {
           deliveryMethod: "delivery",
           orderNote,
           locationLat: body.locationLat,
