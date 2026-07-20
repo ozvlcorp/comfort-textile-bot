@@ -26,7 +26,8 @@ import {
   listSalesReturnPositions,
   updateCounterpartyAddress,
   getCounterparty,
-  getUsdRate
+  getUsdRate,
+  getUzsCurrencyInfo
 } from "../mosklad.js";
 import { generateDemandPdf, makePdfFilename } from "../pdf.js";
 import { buildDemandPdfData } from "../demand-pdf.js";
@@ -78,11 +79,15 @@ export function registerApiRoutes(server: FastifyInstance) {
     }
 
     try {
-      const [balance, balanceCurrency, counterparty] = await Promise.all([
+      const [balanceBase, baseCurrency, counterparty, uzs] = await Promise.all([
         getCustomerBalance(user.moskladCounterpartyId),
         getBaseCurrencyCode(),
-        getCounterparty(user.moskladCounterpartyId).catch(() => null)
+        getCounterparty(user.moskladCounterpartyId).catch(() => null),
+        getUzsCurrencyInfo().catch(() => null)
       ]);
+      const baseIsUsd = (baseCurrency || "").toUpperCase() === "USD";
+      const balance = uzs && baseIsUsd ? balanceBase * uzs.uzsPerUsd : balanceBase;
+      const balanceCurrency = uzs && baseIsUsd ? "UZS" : baseCurrency;
       const coords = parseDefaultAddress(user.defaultAddress);
       const addressAttrId = process.env.MOSKLAD_COUNTERPARTY_ADDRESS_ATTR;
       const addressDetailsAttrId = process.env.COUNTERPARTY_ADDRESS_DETAILS;
