@@ -1689,3 +1689,7 @@ input[type="number"]::-webkit-outer-spin-button {
   font-size: 16px;
   flex-shrink: 0;
 }
+
+/* Hide all product prices in the shop UI (per business request) */
+
+.product-price, .sheet-price, .cart-item-price, .pay-price, .order-position-sum { display: none !important; }
