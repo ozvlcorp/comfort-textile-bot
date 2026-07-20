@@ -512,6 +512,37 @@ export async function getUsdRate(): Promise<number | null> {
   return rate;
 }
 
+// Shop orders are created in UZS (like manually created orders). Returns the UZS
+// currency meta href plus the UZS-per-USD rate from the account's currency
+// directory (manual rate, e.g. 1 USD = 12 070 UZS). Cached for 60 seconds so
+// every new order picks up the current rate almost immediately.
+let _uzsCurrencyCache: { href: string; uzsPerUsd: number; expiresAt: number } | null = null;
+
+async function getUzsCurrencyInfo(): Promise<{ href: string; uzsPerUsd: number } | null> {
+  const now = Date.now();
+  if (_uzsCurrencyCache && _uzsCurrencyCache.expiresAt > now) {
+    return { href: _uzsCurrencyCache.href, uzsPerUsd: _uzsCurrencyCache.uzsPerUsd };
+  }
+  try {
+    const data = await moskladFetch<{
+      rows: Array<{ meta: { href: string }; isoCode?: string; name?: string; rate: number; multiplicity?: number }>;
+    }>("/entity/currency?limit=50");
+    const uzsRow = data.rows.find(
+      (c) => (c.isoCode || "").toUpperCase() === "UZS" || (c.name || "").toLowerCase().includes("сум")
+    );
+    if (!uzsRow?.meta?.href || !uzsRow.rate || uzsRow.rate <= 0) return null;
+    // The directory stores the rate either as UZS-per-USD (12 070, "обратный курс")
+    // or as USD-per-UZS (0.0000828) — disambiguate by magnitude.
+    const k = uzsRow.rate / (uzsRow.multiplicity || 1);
+    const uzsPerUsd = k > 1 ? k : 1 / k;
+    if (!isFinite(uzsPerUsd) || uzsPerUsd < 1000 || uzsPerUsd > 1000000) return null;
+    _uzsCurrencyCache = { href: uzsRow.meta.href, uzsPerUsd, expiresAt: now + 60 * 1000 };
+    return { href: uzsRow.meta.href, uzsPerUsd };
+  } catch {
+    return null;
+  }
+}
+
 type SumRow = { sum?: number; rate?: { value?: number } };
 
 function rowToUsd(row: SumRow, usdRate: number): number {
@@ -630,7 +661,7 @@ export async function listCustomerOrders(counterpartyId: string, offset = 0, lim
   };
 }
 
-type OrderItem = { id: string; quantity: number; price?: number | null };
+type OrderItem = { id: string; quantity: number; price?: number | null; currency?: string | null };
 type DeliveryInfo = {
   deliveryMethod?: "pickup" | "delivery";
   orderNote?: string | null;
@@ -651,21 +682,46 @@ export async function createCustomerOrder(
   }
   const storeId = process.env.MOSKLAD_STORE_ID || (await getDefaultStoreId());
 
-  const positions = items.map((item) => ({
-    quantity: item.quantity,
-    ...(typeof item.price === "number" ? { price: Math.round(item.price * 100) } : {}),
-    assortment: {
-      meta: {
-        href: `${baseUrl}/entity/product/${item.id}`,
-        type: "product",
-        mediaType: "application/json"
-      }
+  // Create the order in UZS (like manual orders): convert non-UZS sale prices
+  // (usually USD) into UZS with the manual rate from the currency directory.
+  // If the directory lookup fails, fall back to the old behavior (no rate).
+  const uzs = await getUzsCurrencyInfo();
+  const positions = items.map((item) => {
+    let price = typeof item.price === "number" ? item.price : null;
+    if (price !== null && uzs) {
+      const cur = (item.currency || "USD").toUpperCase();
+      const isUzs = cur === "UZS" || cur.includes("СУМ") || cur.includes("SO'M") || cur.includes("SOM");
+      if (!isUzs) price = price * uzs.uzsPerUsd;
     }
-  }));
+    return {
+      quantity: item.quantity,
+      ...(price !== null ? { price: Math.round(price * 100) } : {}),
+      assortment: {
+        meta: {
+          href: `${baseUrl}/entity/product/${item.id}`,
+          type: "product",
+          mediaType: "application/json"
+        }
+      }
+    };
+  });
 
   const trimmedNote = deliveryInfo.orderNote?.trim() || undefined;
 
   const orderBody: Record<string, unknown> = {
+    ...(uzs
+      ? {
+          rate: {
+            currency: {
+              meta: {
+                href: uzs.href,
+                type: "currency",
+                mediaType: "application/json"
+              }
+            }
+          }
+        }
+      : {}),
     organization: {
       meta: {
         href: `${baseUrl}/entity/organization/${organizationId}`,
