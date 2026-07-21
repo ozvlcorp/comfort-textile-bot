@@ -33,7 +33,7 @@ type Product = {
   imageCount?: number;
 };
 type CartItem = Product & { quantity: number };
-type Order = { id: string; name: string; moment: string; sum: number; state: string | null };
+type Order = { id: string; name: string; moment: string; sum: number; state: string | null; currency?: string | null };
 
 type Language = "uz" | "uzc" | "ru";
 type View = "home" | "catalog" | "catalog-group" | "cart" | "delivery-select" | "saved" | "profile" | "order-detail";
@@ -888,6 +888,7 @@ export default function App() {
   const [orderDetail, setOrderDetail] = useState<{
     order: any;
     positions: any[];
+    orderCurrency?: string | null;
     deliveryMethod: string | null;
     driverInfo: { model: string | null; number: string | null } | null;
     addressText: string | null;
@@ -1914,7 +1915,7 @@ export default function App() {
                   <div className="order-row-date">{formatDate(order.moment)}</div>
                   {order.state && <div className="order-row-state">{order.state}</div>}
                 </div>
-                <div className="order-row-sum">{formatMoney(order.sum, userInfo.balanceCurrency || null, lang)}</div>
+                <div className="order-row-sum">{formatMoney(order.sum, order.currency || null, lang)}</div>
                 <HugeiconsIcon icon={ArrowRight01Icon} size={18} color="currentColor" strokeWidth={1.5} />
               </div>
             ))
@@ -2017,7 +2018,7 @@ export default function App() {
                       <span className="order-position-qty">×{pos.quantity}</span>
                       {pos.price != null && (
                         <span className="order-position-sum">
-                          {formatMoney(pos.price * pos.quantity, userInfo.balanceCurrency || null, lang)}
+                          {formatMoney(pos.price * pos.quantity, orderDetail.orderCurrency || null, lang)}
                         </span>
                       )}
                     </div>
@@ -2028,7 +2029,7 @@ export default function App() {
               {/* Total */}
               {typeof orderDetail.order.sum === "number" && (
                 <div className="order-total">
-                  {t.orderTotal}: {formatMoney(orderDetail.order.sum / 100, userInfo.balanceCurrency || null, lang)}
+                  {t.orderTotal}: {formatMoney(orderDetail.order.sum / 100, orderDetail.orderCurrency || null, lang)}
                 </div>
               )}
 
@@ -2036,14 +2037,14 @@ export default function App() {
               {!!orderDetail.paidAmount && orderDetail.paidAmount > 0 && (
                 <div className="order-detail-field">
                   <span className="order-detail-field-label">{t.orderPaid}</span>
-                  <span className="order-detail-field-value">{formatMoney(orderDetail.paidAmount, userInfo.balanceCurrency || null, lang)}</span>
+                  <span className="order-detail-field-value">{formatMoney(orderDetail.paidAmount, orderDetail.orderCurrency || null, lang)}</span>
                 </div>
               )}
               {!!orderDetail.dueAmount && orderDetail.dueAmount > 0 && (
                 <div className="order-detail-field">
                   <span className="order-detail-field-label">{t.orderDue}</span>
                   <span className="order-detail-field-value" style={{ color: "var(--tg-theme-destructive-text-color, #e53935)" }}>
-                    {formatMoney(orderDetail.dueAmount, userInfo.balanceCurrency || null, lang)}
+                    {formatMoney(orderDetail.dueAmount, orderDetail.orderCurrency || null, lang)}
                   </span>
                 </div>
               )}
