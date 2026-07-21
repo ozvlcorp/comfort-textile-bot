@@ -27,7 +27,8 @@ import {
   updateCounterpartyAddress,
   getCounterparty,
   getUsdRate,
-  getUzsCurrencyInfo
+  getCurrencyIsoMap,
+  currencyIsoFromHref
 } from "../mosklad.js";
 import { generateDemandPdf, makePdfFilename } from "../pdf.js";
 import { buildDemandPdfData } from "../demand-pdf.js";
@@ -79,15 +80,14 @@ export function registerApiRoutes(server: FastifyInstance) {
     }
 
     try {
-      const [balanceBase, baseCurrency, counterparty, uzs] = await Promise.all([
+      const [balanceBase, baseCurrency, counterparty] = await Promise.all([
         getCustomerBalance(user.moskladCounterpartyId),
         getBaseCurrencyCode(),
-        getCounterparty(user.moskladCounterpartyId).catch(() => null),
-        getUzsCurrencyInfo().catch(() => null)
+        getCounterparty(user.moskladCounterpartyId).catch(() => null)
       ]);
-      const baseIsUsd = (baseCurrency || "").toUpperCase() === "USD";
-      const balance = uzs && baseIsUsd ? balanceBase * uzs.uzsPerUsd : balanceBase;
-      const balanceCurrency = uzs && baseIsUsd ? "UZS" : baseCurrency;
+      // Balance stays in the account base currency; each order shows its own currency.
+      const balance = balanceBase;
+      const balanceCurrency = baseCurrency;
       const coords = parseDefaultAddress(user.defaultAddress);
       const addressAttrId = process.env.MOSKLAD_COUNTERPARTY_ADDRESS_ATTR;
       const addressDetailsAttrId = process.env.COUNTERPARTY_ADDRESS_DETAILS;
@@ -1270,7 +1270,9 @@ export function registerApiRoutes(server: FastifyInstance) {
         || order.shipmentAddress || null;
       const addressExtra = extractAttributeValue(order.attributes || [], envList("ORDER_ADDRESS_DETAILS"));
       const due = (order.sum ?? 0) / 100;
-      return { order, positions, deliveryMethod, driverInfo, addressText, addressExtra, paidAmount: 0, dueAmount: due };
+      const isoMap = await getCurrencyIsoMap();
+      const orderCurrency = currencyIsoFromHref(order.rate?.currency?.meta?.href, isoMap);
+      return { order, positions, orderCurrency, deliveryMethod, driverInfo, addressText, addressExtra, paidAmount: 0, dueAmount: due };
     } catch {
       reply.code(404);
       return { error: "Order not found" };
