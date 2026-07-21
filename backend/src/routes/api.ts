@@ -1322,6 +1322,56 @@ export function registerApiRoutes(server: FastifyInstance) {
     }
   });
 
+  // GET /api/orders/:orderId/invoice.pdf?telegramId=
+  // Returns the shipment (накладная) PDF bytes for the order's latest demand, so the
+  // Mini App can open/download it directly (the Telegram bot is off in the shop, so the
+  // old "send document via bot" path never delivered anything).
+  server.get("/api/orders/:orderId/invoice.pdf", async (request, reply) => {
+    const { orderId } = request.params as { orderId: string };
+    const { telegramId } = request.query as { telegramId?: string };
+    if (!telegramId) { reply.code(400); return { error: "telegramId required" }; }
+    const user = await prisma.user.findUnique({ where: { telegramId } });
+    if (!user || !user.moskladCounterpartyId) { reply.code(404); return { error: "User not found" }; }
+    try {
+      const order = await getCustomerOrder(orderId);
+      // Ownership check via the order's counterparty
+      const orderCounterpartyId = extractIdFromHref(order.agent?.meta?.href, "/entity/counterparty/");
+      if (!orderCounterpartyId || orderCounterpartyId !== user.moskladCounterpartyId) {
+        reply.code(403); return { error: "Forbidden" };
+      }
+      const demands = order.demands || [];
+      if (demands.length === 0) { reply.code(404); return { error: "No invoice yet" }; }
+      // Pick the latest demand (накладная) by moment.
+      const demandRef = [...demands].sort((a, b) => (b.moment || "").localeCompare(a.moment || ""))[0];
+      const [demand, positions, currencyCode] = await Promise.all([
+        getDemand(demandRef.id),
+        listDemandPositions(demandRef.id).catch(() => [] as Awaited<ReturnType<typeof listDemandPositions>>),
+        getBaseCurrencyCode().catch(() => null)
+      ]);
+      const demandSum = typeof demand.sum === "number" ? demand.sum / 100 : null;
+      const balanceAfter = await getCustomerBalance(orderCounterpartyId).catch(() => null);
+      const balanceBefore = balanceAfter !== null && demandSum !== null ? balanceAfter + demandSum : null;
+      const { positions: pdfPositions, leftToPay } = await buildDemandPdfData(demand, positions);
+      const pdfBuffer = await generateDemandPdf({
+        demand: { ...demand, sum: demandSum ?? undefined },
+        positions: pdfPositions,
+        client: { firstName: demand.agent?.name || user.firstName, lastName: null, phoneNumber: user.phoneNumber },
+        lang: user.language || "uz",
+        currencyCode,
+        leftToPay,
+        balanceBefore,
+        balanceAfter,
+        deliveryAddress: demand.shipmentAddress || null
+      });
+      reply.header("Content-Type", "application/pdf");
+      reply.header("Content-Disposition", "inline");
+      return reply.send(pdfBuffer);
+    } catch (err) {
+      console.error("order invoice PDF error:", err);
+      reply.code(500); return { error: "Failed to generate PDF" };
+    }
+  });
+
   server.post("/api/send-debt-reminder", async (request, reply) => {
     const apiKey = (request.headers as Record<string, string | undefined>)['x-api-key'];
     if (!apiKey || apiKey !== process.env.DASHBOARD_API_KEY) {
