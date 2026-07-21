@@ -1214,6 +1214,17 @@ export default function App() {
       .catch(() => { setLoadingDemandId(null); });
   }
 
+  // Opens the shipment (накладная) PDF for an order directly in the browser. The backend
+  // resolves the order's demand and streams the PDF bytes, so this works with the bot off.
+  function openInvoicePdf(orderId: string) {
+    if (!telegramId) return;
+    (window as any).Telegram?.WebApp?.HapticFeedback?.impactOccurred?.("light");
+    const url = `${apiUrl}/api/orders/${orderId}/invoice.pdf?telegramId=${telegramId}`;
+    const tg = (window as any).Telegram?.WebApp;
+    if (tg?.openLink) tg.openLink(url);
+    else window.open(url, "_blank");
+  }
+
   const addToCart = useCallback((product: Product) => {
     const stockLimit = product.stock ?? MAX_QTY;
     if (stockLimit <= 0) return;
@@ -2049,13 +2060,13 @@ export default function App() {
                 </div>
               )}
 
-              {/* PDF receipt button for this demand */}
-              {orderDetail.order.id && (() => {
+              {/* PDF receipt button — only when the order has a shipment (накладная) */}
+              {orderDetail.order.id && (orderDetail.order.demands?.length > 0) && (() => {
                 const isThisLoading = loadingDemandId === orderDetail.order.id;
                 return (
                   <button
                     className={`demand-pdf-btn${isThisLoading ? " demand-pdf-btn--loading" : ""}`}
-                    onClick={() => requestDemandPdf(orderDetail.order.id)}
+                    onClick={() => openInvoicePdf(orderDetail.order.id)}
                     disabled={!!loadingDemandId}
                   >
                     {isThisLoading && <span className="button-spinner" />}
