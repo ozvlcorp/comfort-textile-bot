@@ -543,6 +543,43 @@ export async function getUzsCurrencyInfo(): Promise<{ href: string; uzsPerUsd: n
   }
 }
 
+// Maps a MoySklad currency id (the last path segment of its meta.href) to its ISO
+// code (e.g. "UZS", "USD"). Lets us show every document in its own currency without
+// relying on nested expand of rate.currency, which is not always accepted and would
+// break the whole request if rejected. Cached for 5 minutes.
+let _currencyIsoMapCache: { map: Record<string, string>; expiresAt: number } | null = null;
+export async function getCurrencyIsoMap(): Promise<Record<string, string>> {
+  const now = Date.now();
+  if (_currencyIsoMapCache && _currencyIsoMapCache.expiresAt > now) {
+    return _currencyIsoMapCache.map;
+  }
+  const map: Record<string, string> = {};
+  try {
+    const data = await moskladFetch<{
+      rows: Array<{ id?: string; meta?: { href?: string }; isoCode?: string; name?: string }>;
+    }>("/entity/currency?limit=100");
+    for (const c of data.rows) {
+      const iso = c.isoCode || c.name;
+      const id = c.id || (c.meta?.href ? c.meta.href.split("/").pop() : undefined);
+      if (id && iso) map[id] = iso;
+    }
+  } catch {
+    // Leave the map empty; callers fall back to null.
+  }
+  _currencyIsoMapCache = { map, expiresAt: now + 5 * 60 * 1000 };
+  return map;
+}
+
+// Resolves a currency reference href (e.g. ".../entity/currency/<id>") to its ISO code.
+export function currencyIsoFromHref(
+  href: string | undefined | null,
+  map: Record<string, string>
+): string | null {
+  if (!href) return null;
+  const id = href.split("/").pop();
+  return (id && map[id]) || null;
+}
+
 type SumRow = { sum?: number; rate?: { value?: number } };
 
 function rowToUsd(row: SumRow, usdRate: number): number {
@@ -642,12 +679,14 @@ export async function listCustomerOrders(counterpartyId: string, offset = 0, lim
       moment: string;
       sum: number;
       state?: { name?: string };
+      rate?: { currency?: { meta?: { href?: string } } };
       attributes?: Array<{ name: string; value: string | number | boolean | null }>;
     }>;
   }>(
     `/entity/customerorder?filter=agent=${encodeURIComponent(`${baseUrl}/entity/counterparty/${counterpartyId}`)}&order=moment,desc&limit=${limit}&offset=${offset}&expand=state`
   );
 
+  const isoMap = await getCurrencyIsoMap();
   return {
     rows: data.rows.map((row) => ({
       id: row.id,
@@ -655,6 +694,7 @@ export async function listCustomerOrders(counterpartyId: string, offset = 0, lim
       moment: row.moment,
       sum: row.sum / 100,
       state: row.state?.name || null,
+      currency: currencyIsoFromHref(row.rate?.currency?.meta?.href, isoMap),
       driverInfo: extractDriverInfo(row.attributes || [])
     })),
     total: data.meta?.size ?? 0
@@ -1047,7 +1087,7 @@ export async function getCustomerOrder(orderId: string) {
     attributes?: Array<{ id?: string; name: string; value: any; meta?: { href?: string } }>;
     demands?: Array<{ id: string; name: string; moment: string; sum: number; state?: { name?: string } }>;
     currency?: { isoCode?: string };
-    rate?: { value?: number };
+    rate?: { value?: number; currency?: { meta?: { href?: string } } };
   }>(`/entity/customerorder/${orderId}?expand=state,demands,demands.state,agent,currency`);
 }
 
