@@ -326,8 +326,9 @@ export function registerApiRoutes(server: FastifyInstance) {
       }
     }
 
-    // Handle delivery with location from webapp: create order immediately
-    if (body.deliveryMethod === "delivery" && user.phoneNumber && body.locationLat && body.locationLng) {
+    // Handle delivery from webapp: create order immediately when we have either GPS
+    // coordinates or a typed address (the Yandex map is optional / can fail in the webview).
+    if (body.deliveryMethod === "delivery" && user.phoneNumber && ((body.locationLat && body.locationLng) || body.addressDetails)) {
       try {
         const counterpartyId = await getOrCreateCounterparty(
           user.telegramId,
@@ -357,15 +358,17 @@ export function registerApiRoutes(server: FastifyInstance) {
               : "📝 Buyurtma qabul qilindi.") + buildBalanceFooter(delivBalance, delivCurrency, lang);
         await sendTelegramMessage(user.telegramId, receivedMsg);
 
-        // Save delivery location as user's default address
-        const gpsString = `${body.locationLat},${body.locationLng}`;
-        const yandexMapsLink = `https://yandex.ru/maps/?ll=${body.locationLng},${body.locationLat}&z=16&pt=${body.locationLng},${body.locationLat}`;
-        await prisma.user.update({ where: { id: user.id }, data: { defaultAddress: gpsString } });
-        await updateCounterpartyAddress(counterpartyId, {
-          location: yandexMapsLink,
-          addressName: body.addressDetails || null,
-          addressExtra: body.addressExtra || null
-        }).catch(() => {});
+        // Save delivery location as user's default address (only when GPS is present)
+        if (body.locationLat && body.locationLng) {
+          const gpsString = `${body.locationLat},${body.locationLng}`;
+          const yandexMapsLink = `https://yandex.ru/maps/?ll=${body.locationLng},${body.locationLat}&z=16&pt=${body.locationLng},${body.locationLat}`;
+          await prisma.user.update({ where: { id: user.id }, data: { defaultAddress: gpsString } });
+          await updateCounterpartyAddress(counterpartyId, {
+            location: yandexMapsLink,
+            addressName: body.addressDetails || null,
+            addressExtra: body.addressExtra || null
+          }).catch(() => {});
+        }
 
         return { orderName: order.name };
       } catch (err) {
