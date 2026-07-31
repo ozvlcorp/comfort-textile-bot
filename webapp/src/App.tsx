@@ -1354,7 +1354,7 @@ export default function App() {
   }, [selectedDeliveryMethod, userInfo?.defaultLat, userInfo?.defaultLng, userInfo?.defaultAddressText, userInfo?.defaultAddressExtra, deliveryLat]);
 
   async function handleDeliverySubmit() {
-    if (!deliveryLat || !deliveryLng) return;
+    if ((!deliveryLat || !deliveryLng) && !deliveryAddress.trim()) return;
     setLoading(true);
     setError("");
     try {
@@ -1795,14 +1795,20 @@ export default function App() {
               <div className="delivery-form">
                 <div className="address-field">
                   <label className="order-note-label">{t.fullAddressLabel}</label>
+                  <input
+                    className="address-input"
+                    type="text"
+                    value={deliveryAddress}
+                    onChange={(e) => setDeliveryAddress(e.target.value)}
+                    placeholder={t.fullAddressPlaceholder}
+                  />
                   <button
                     className="address-picker"
                     onClick={() => setMapDrawerOpen(true)}
                     type="button"
+                    style={{ marginTop: 8 }}
                   >
-                    <span className={`address-picker-text${deliveryAddress ? " filled" : ""}`}>
-                      {deliveryAddress || t.fullAddressPlaceholder}
-                    </span>
+                    <span className="address-picker-text">📍 {t.selectOnMap}</span>
                   </button>
                 </div>
                 <div className="address-grid">
@@ -2117,7 +2123,7 @@ export default function App() {
             disabled={
               loading ||
               (view === "delivery-select" && !selectedDeliveryMethod) ||
-              (view === "delivery-select" && selectedDeliveryMethod === "delivery" && !deliveryLat)
+              (view === "delivery-select" && selectedDeliveryMethod === "delivery" && !deliveryLat && !deliveryAddress.trim())
             }
           >
             <span className="pay-button-content">
