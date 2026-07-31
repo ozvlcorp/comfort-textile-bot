@@ -748,6 +748,18 @@ export async function createCustomerOrder(
 
   const trimmedNote = deliveryInfo.orderNote?.trim() || undefined;
 
+  // Put the address, extra details and (if present) the GPS map link into the standard
+  // shipmentAddress field, so the operator sees where to deliver even though the custom
+  // MoySklad delivery attributes are disabled.
+  const shipmentAddressParts = [
+    deliveryInfo.addressText || null,
+    deliveryInfo.addressExtra || null,
+    deliveryInfo.locationLat && deliveryInfo.locationLng
+      ? formatYandexMapsLink(deliveryInfo.locationLat, deliveryInfo.locationLng)
+      : null
+  ].filter(Boolean);
+  const shipmentAddress =
+    shipmentAddressParts.length > 0 ? shipmentAddressParts.join(" | ") : undefined;
   const orderBody: Record<string, unknown> = {
     ...(uzs
       ? {
@@ -788,7 +800,7 @@ export async function createCustomerOrder(
       }
     },
     positions,
-    shipmentAddress: deliveryInfo.addressText || undefined,
+    shipmentAddress,
     ...(trimmedNote ? { description: trimmedNote } : {})
   };
 
