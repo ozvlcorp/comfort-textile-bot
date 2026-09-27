@@ -115,19 +115,19 @@ export function startReminderWorker(bot: Telegraf) {
     }
 
     const now = new Date();
-    if (
-      now.getDay() !== targetWeekday ||
-      now.getHours() !== targetHour ||
-      now.getMinutes() !== targetMinute
-    ) {
+    if (now.getHours() !== targetHour || now.getMinutes() !== targetMinute) {
       return;
     }
 
     isProcessing = true;
 
     try {
-      await processDebtReminders(bot, now);
+      // Order reminders go out every day as they come due; the debt reminder only on targetWeekday.
+      // Order reminders run first: they are quick and must not be skipped if the debt run throws.
       await processOrderReminders(bot, now);
+      if (now.getDay() === targetWeekday) {
+        await processDebtReminders(bot, now);
+      }
     } catch (err) {
       console.error('Error in reminder worker:', err);
     } finally {
@@ -213,24 +213,35 @@ async function processOrderReminders(bot: Telegraf, now: Date) {
       orderBy: { dueAt: "asc" }
     });
 
-    for (const reminder of dueReminders) {
+    // One message per user per run, even if several of their reminders are due at once
+    // (e.g. after a missed run) — that single message closes all of them.
+    const users = new Map(dueReminders.map((reminder) => [reminder.userId, reminder.user]));
+
+    for (const [userId, user] of users) {
+      const closeDueReminders = () =>
+        prisma.reminder.updateMany({
+          where: { userId, dueAt: { lte: now }, sentAt: null },
+          data: { sentAt: now }
+        });
+
       try {
         const message =
-          reminder.user.language === "ru"
+          user.language === "ru"
             ? `Довольны заказом? Готовы заказать ещё? 🛒`
-            : reminder.user.language === "uzc"
+            : user.language === "uzc"
               ? `Буюртмангиздан мамнунмисиз? Яна буюртма беришга тайёрмисиз? 🛒`
               : `Buyurtmangizdan mamnunmisiz? Yana buyurtma berishga tayyormisiz? 🛒`;
 
-        await safeSend(bot.telegram, reminder.user.telegramId, message);
-
-        // Mark as sent
-        await prisma.reminder.update({
-          where: { id: reminder.id },
-          data: { sentAt: now }
-        });
+        await safeSend(bot.telegram, user.telegramId, message);
+        await closeDueReminders();
       } catch (err) {
-        console.error(`Error sending reminder ${reminder.id}:`, err);
+        // Telegram 400/403 (bot blocked, chat gone) won't heal: close the reminders instead of
+        // retrying them daily, where they would pile up and crowd new ones out of the batch.
+        const code = (err as { code?: unknown } | null)?.code;
+        if (code === 400 || code === 403) {
+          await closeDueReminders().catch(() => {});
+        }
+        console.error(`Error sending order reminder to user ${userId}:`, err);
       }
     }
 
