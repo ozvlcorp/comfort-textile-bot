@@ -1170,7 +1170,7 @@ input[type="number"]::-webkit-outer-spin-button {
   cursor: not-allowed;
 }
 
-/* Yandex Maps picker */
+/* Map picker (Leaflet + OpenStreetMap) */
 .ymap-container {
   width: 100%;
   height: 240px;
@@ -1178,14 +1178,20 @@ input[type="number"]::-webkit-outer-spin-button {
   overflow: hidden;
 }
 
-.ymap-marker {
-  width: 20px;
-  height: 20px;
+/* Leaflet stacks its own layers at z-index 400–1000. Keep them inside the map
+   so the drawer's close button (z-index 210) stays clickable on top. */
+.ymap-container,
+.ymap-fullscreen {
+  isolation: isolate;
+}
+
+/* Selected point: Leaflet sizes and centres it from iconSize, hence border-box. */
+.map-pin {
+  box-sizing: border-box;
   background: var(--accent);
   border-radius: 50%;
   border: 3px solid white;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
-  transform: translate(-50%, -50%);
 }
 
 .location-status {

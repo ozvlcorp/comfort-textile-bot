@@ -627,16 +627,26 @@ function ProductSheet({
   );
 }
 
+// Point → address through OpenStreetMap's free Nominatim service (no key).
+// Its usage policy allows light use — at most one request per second from an
+// identifiable app (the browser sends the shop's Referer) — so calls are spaced.
+const GEOCODE_MIN_INTERVAL_MS = 1100;
+let lastGeocodeAt = 0;
+
 async function geocodeCoords(lng: number, lat: number): Promise<string> {
-  const apiKey = import.meta.env.VITE_YANDEX_MAPS_API_KEY;
+  const wait = lastGeocodeAt + GEOCODE_MIN_INTERVAL_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastGeocodeAt = Date.now();
   const resp = await fetch(
-    `https://geocode-maps.yandex.ru/1.x/?apikey=${apiKey}&geocode=${lng},${lat}&format=json&lang=ru_RU`
+    `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1&accept-language=ru`
   );
+  if (!resp.ok) return "";
   const data = await resp.json();
-  return (
-    data?.response?.GeoObjectCollection?.featureMember?.[0]
-      ?.GeoObject?.metaDataProperty?.GeocoderMetaData?.text || ""
-  );
+  const a = data?.address || {};
+  const street = [a.road || a.pedestrian || a.neighbourhood, a.house_number].filter(Boolean).join(", ");
+  const area = a.suburb || a.city_district || a.quarter;
+  const city = a.city || a.town || a.village;
+  return [street, area, city].filter(Boolean).join(", ") || data?.display_name || "";
 }
 
 function parseAddressExtra(extra: string | null | undefined) {
@@ -656,7 +666,43 @@ function parseAddressExtra(extra: string | null | undefined) {
   return result;
 }
 
-function YandexMapPicker({
+// Free map: Leaflet (BSD-2, vendored under public/vendor so no third-party script
+// or API key is involved) with OpenStreetMap tiles, whose usage policy requires
+// the attribution shown in the corner of the map.
+const LEAFLET_BASE = `${import.meta.env.BASE_URL}vendor/leaflet-1.9.4/`;
+let leafletPromise: Promise<any> | null = null;
+
+function loadLeaflet(): Promise<any> {
+  const w = window as any;
+  if (w.L) return Promise.resolve(w.L);
+  if (leafletPromise) return leafletPromise;
+  const css = new Promise<void>((resolve) => {
+    if (document.getElementById("leaflet-css")) return resolve();
+    const link = document.createElement("link");
+    link.id = "leaflet-css";
+    link.rel = "stylesheet";
+    link.href = `${LEAFLET_BASE}leaflet.css`;
+    link.onload = () => resolve();
+    link.onerror = () => resolve(); // the map still works, only unstyled
+    document.head.appendChild(link);
+  });
+  const js = new Promise<any>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = `${LEAFLET_BASE}leaflet.js`;
+    script.onload = () => (w.L ? resolve(w.L) : reject(new Error("Leaflet did not load")));
+    script.onerror = () => reject(new Error("Leaflet failed to load"));
+    document.head.appendChild(script);
+  });
+  leafletPromise = Promise.all([css, js])
+    .then(([, L]) => L)
+    .catch((err) => {
+      leafletPromise = null; // let the next opening of the map try again
+      throw err;
+    });
+  return leafletPromise;
+}
+
+function MapPicker({
   onSelect,
   lat,
   lng,
@@ -671,78 +717,47 @@ function YandexMapPicker({
   const mapRef = useRef<any>(null);
   const markerRef = useRef<any>(null);
   const onSelectRef = useRef(onSelect);
+  const [mapReady, setMapReady] = useState(false);
   useEffect(() => { onSelectRef.current = onSelect; }, [onSelect]);
 
   useEffect(() => {
-    const apiKey = import.meta.env.VITE_YANDEX_MAPS_API_KEY;
-    if (!document.getElementById("ymaps3-script")) {
-      const script = document.createElement("script");
-      script.id = "ymaps3-script";
-      script.src = `https://api-maps.yandex.ru/v3/?apikey=${apiKey}&lang=ru_RU`;
-      document.head.appendChild(script);
-    }
-
     let destroyed = false;
-    const initMap = async () => {
-      if (destroyed || !containerRef.current || mapRef.current) return;
-      const ymaps3 = (window as any).ymaps3;
-      if (!ymaps3) return;
-      await ymaps3.ready;
-      if (destroyed || !containerRef.current || mapRef.current) return;
-      const { YMap, YMapDefaultSchemeLayer, YMapDefaultFeaturesLayer, YMapListener } = ymaps3;
-      const map = new YMap(containerRef.current, {
-        location: { center: [69.24, 41.30], zoom: 12 }
-      });
-      map.addChild(new YMapDefaultSchemeLayer());
-      map.addChild(new YMapDefaultFeaturesLayer());
-      const listener = new YMapListener({
-        layer: "any",
-        onClick: (_obj: any, event: any) => {
-          const [clickLng, clickLat] = event.coordinates;
-          onSelectRef.current(clickLat, clickLng);
-        }
-      });
-      map.addChild(listener);
-      mapRef.current = map;
-    };
-
-    const script = document.getElementById("ymaps3-script") as HTMLScriptElement | null;
-    if ((window as any).ymaps3) {
-      initMap();
-      return () => {
-        destroyed = true;
-        if (mapRef.current) { mapRef.current.destroy?.(); mapRef.current = null; }
-      };
-    } else if (script) {
-      script.addEventListener("load", initMap);
-      return () => {
-        destroyed = true;
-        script.removeEventListener("load", initMap);
-        if (mapRef.current) { mapRef.current.destroy?.(); mapRef.current = null; }
-      };
-    }
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    loadLeaflet()
+      .then((L) => {
+        if (destroyed || !containerRef.current || mapRef.current) return;
+        const map = L.map(containerRef.current).setView([41.30, 69.24], 12);
+        map.attributionControl.setPrefix('<a href="https://leafletjs.com">Leaflet</a>');
+        L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        }).addTo(map);
+        map.on("click", (e: any) => onSelectRef.current(e.latlng.lat, e.latlng.lng));
+        mapRef.current = map;
+        // The map opens inside a sliding drawer: re-measure once it has settled.
+        resizeTimer = setTimeout(() => map.invalidateSize(), 400);
+        setMapReady(true);
+      })
+      .catch(() => {});
     return () => {
       destroyed = true;
-      if (mapRef.current) { mapRef.current.destroy?.(); mapRef.current = null; }
+      if (resizeTimer) clearTimeout(resizeTimer);
+      if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; }
+      markerRef.current = null;
     };
   }, []);
 
   useEffect(() => {
-    if (!mapRef.current || lat === null || lng === null) return;
-    const ymaps3 = (window as any).ymaps3;
-    if (!ymaps3) return;
-    const { YMapMarker } = ymaps3;
+    const L = (window as any).L;
+    if (!mapReady || !mapRef.current || !L || lat === null || lng === null) return;
     if (markerRef.current) {
-      mapRef.current.removeChild(markerRef.current);
-      markerRef.current = null;
+      markerRef.current.setLatLng([lat, lng]);
+    } else {
+      const icon = L.divIcon({ className: "map-pin", iconSize: [22, 22] });
+      markerRef.current = L.marker([lat, lng], { icon, keyboard: false }).addTo(mapRef.current);
     }
-    const el = document.createElement("div");
-    el.className = "ymap-marker";
-    const marker = new YMapMarker({ coordinates: [lng, lat] }, el);
-    mapRef.current.addChild(marker);
-    markerRef.current = marker;
-    mapRef.current.setLocation({ center: [lng, lat], zoom: 15, duration: 300 });
-  }, [lat, lng]);
+    mapRef.current.setView([lat, lng], Math.max(mapRef.current.getZoom(), 15));
+  }, [lat, lng, mapReady]);
 
   return <div ref={containerRef} className={className || "ymap-container"} />;
 }
@@ -772,12 +787,16 @@ function MapDrawer({
 
   function dismiss() { setClosing(true); }
 
+  // Only the answer for the latest tap may set the address: geocoding is
+  // spaced out, so answers for earlier taps can arrive after a newer one.
+  const geocodeSeq = useRef(0);
   async function handleMapSelect(selLat: number, selLng: number) {
     setLocalLat(selLat);
     setLocalLng(selLng);
+    const seq = ++geocodeSeq.current;
     try {
       const addr = await geocodeCoords(selLng, selLat);
-      if (addr) setLocalAddress(addr);
+      if (addr && seq === geocodeSeq.current) setLocalAddress(addr);
     } catch {}
   }
 
@@ -806,7 +825,7 @@ function MapDrawer({
           if (closing && e.propertyName === "transform") onClose();
         }}
       >
-        <YandexMapPicker
+        <MapPicker
           onSelect={handleMapSelect}
           lat={localLat}
           lng={localLng}
