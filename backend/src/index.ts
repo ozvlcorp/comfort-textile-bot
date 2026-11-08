@@ -124,11 +124,32 @@ try {
 
 // Start Telegram bot after HTTP server is up to avoid blocking health checks
 const botToken = process.env.BOT_TOKEN;
-if (botToken) {
+// SHOP_BOT_MODE=shared: BOT_TOKEN belongs to the main bot (@Comfort_txt_bot),
+// whose own process already receives its updates — Telegram allows only one
+// receiver per bot. The shop then only sends through it (order notices, admin
+// alerts); updates, reminders and reports stay with the main bot, and customers
+// register from the webapp (POST /api/register-contact).
+const sharedMainBot = process.env.SHOP_BOT_MODE === "shared";
+if (botToken && sharedMainBot) {
+  server.log.info("Telegram: shared main bot — sending only (no polling, reminders or reports)");
+} else if (botToken) {
   (async () => {
     try {
       bot = createBot(botToken);
       bot.launch().catch((err: unknown) => {
+        // 409: another process already receives this bot's updates (e.g. the main
+        // bot with the same token). A restart can't fix that, and exiting would
+        // put the whole shop API into a restart loop — keep serving without the bot.
+        const e = err as { response?: { error_code?: number }; message?: string };
+        if (e?.response?.error_code === 409 || /\b409\b|Conflict/.test(String(e?.message))) {
+          stopReminderWorker();
+          stopReportScheduler();
+          server.log.error(
+            { err },
+            "Telegram bot disabled: this token is already polled by another process. If it is the main bot's token, set SHOP_BOT_MODE=shared."
+          );
+          return;
+        }
         // Fatal polling failure — exit so PM2 can do a clean restart.
         server.log.error({ err }, "Telegram bot polling crashed fatally — exiting for PM2 restart");
         if (!isShuttingDown) process.exit(1);

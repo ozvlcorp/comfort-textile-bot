@@ -179,6 +179,9 @@ const copy = {
     backToCart: "Orqaga",
     notRegistered: "Iltimos, avval botda ro'yxatdan o'ting.",
     notDetected: "Telegram orqali oching.",
+    registerHint: "Buyurtma berish uchun telefon raqamingizni yuboring.",
+    sharePhone: "📱 Telefon raqamni yuborish",
+    registerFailed: "Ro'yxatdan o'tib bo'lmadi. Qayta urinib ko'ring.",
     balance: "Balans",
     outOfStock: "Qolmagan",
     allProducts: "Barcha mahsulotlar",
@@ -244,6 +247,9 @@ const copy = {
     backToCart: "Орқага",
     notRegistered: "Илтимос, аввал ботда рўйхатдан ўтинг.",
     notDetected: "Telegram орқали очинг.",
+    registerHint: "Буюртма бериш учун телефон рақамингизни юборинг.",
+    sharePhone: "📱 Телефон рақамни юбориш",
+    registerFailed: "Рўйхатдан ўтиб бўлмади. Қайта уриниб кўринг.",
     balance: "Баланс",
     outOfStock: "Қолмаган",
     allProducts: "Барча маҳсулотлар",
@@ -309,6 +315,9 @@ const copy = {
     backToCart: "Назад",
     notRegistered: "Пожалуйста, сначала зарегистрируйтесь в боте.",
     notDetected: "Откройте через Telegram.",
+    registerHint: "Чтобы оформлять заказы, отправьте свой номер телефона.",
+    sharePhone: "📱 Отправить номер телефона",
+    registerFailed: "Не удалось зарегистрироваться. Попробуйте ещё раз.",
     balance: "Баланс",
     outOfStock: "Нет в наличии",
     allProducts: "Все товары",
@@ -888,6 +897,8 @@ export default function App() {
   } | null>(null);
   const [userInfoLoading, setUserInfoLoading] = useState(true);
   const [telegramId, setTelegramId] = useState<string | null>(null);
+  const [userInfoReload, setUserInfoReload] = useState(0);
+  const [registering, setRegistering] = useState(false);
   const [deliveryLat, setDeliveryLat] = useState<number | null>(null);
   const [deliveryLng, setDeliveryLng] = useState<number | null>(null);
   const [addrKvartira, setAddrKvartira] = useState("");
@@ -982,7 +993,38 @@ export default function App() {
       .then((data) => { if (data) setUserInfo(data); })
       .catch(() => {})
       .finally(() => setUserInfoLoading(false));
-  }, [telegramId]);
+  }, [telegramId, userInfoReload]);
+
+  // Registration without the bot chat: Telegram shows its own "share phone"
+  // prompt and returns the contact signed with the bot token; the backend checks
+  // the signature and links the customer to their MoySklad counterparty.
+  const canSharePhone = useMemo(() => {
+    const tg = (window as any).Telegram?.WebApp;
+    return typeof tg?.requestContact === "function" && !!tg.isVersionAtLeast?.("6.9");
+  }, []);
+
+  function handleSharePhone() {
+    const tg = (window as any).Telegram?.WebApp;
+    if (!tg?.requestContact || registering) return;
+    setRegistering(true);
+    tg.requestContact(async (shared: boolean, result?: { response?: string }) => {
+      try {
+        if (!shared || !result?.response) return;
+        const resp = await fetch(`${apiUrl}/api/register-contact`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contact: result.response, language: lang })
+        });
+        if (!resp.ok) throw new Error(`register-contact ${resp.status}`);
+        setUserInfoReload((n) => n + 1);
+      } catch {
+        if (tg.showAlert) tg.showAlert(t.registerFailed);
+        else window.alert(t.registerFailed);
+      } finally {
+        setRegistering(false);
+      }
+    });
+  }
 
   // Fetch liked products after user info loaded
   useEffect(() => {
@@ -1595,8 +1637,13 @@ export default function App() {
           <div className="empty-state">
             <HugeiconsIcon icon={InboxIcon} size={48} color="currentColor" strokeWidth={1.5} />
             <div className="muted">
-              {!telegramId ? t.notDetected : t.notRegistered}
+              {!telegramId ? t.notDetected : canSharePhone ? t.registerHint : t.notRegistered}
             </div>
+            {telegramId && canSharePhone && (
+              <button className="pay-button" onClick={handleSharePhone} disabled={registering}>
+                <span className="pay-button-content">{t.sharePhone}</span>
+              </button>
+            )}
           </div>
         </section>
       )}
