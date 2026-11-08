@@ -35,6 +35,8 @@ import { generateDemandPdf, makePdfFilename } from "../pdf.js";
 import { buildDemandPdfData } from "../demand-pdf.js";
 import { createOrderReminders } from "../reminders.js";
 import { cache } from "../cache.js";
+import { verifyTelegramSignedData } from "../telegram-auth.js";
+import { registerContact } from "../registration.js";
 
 // Permanent in-process caches for images (survive until server restart)
 // Image IDs are stable UUIDs in MoySklad — safe to cache indefinitely.
@@ -55,6 +57,12 @@ function isMoskladId(value: string): boolean {
 // these cached, read-only routes get their own per-client budget instead of
 // sharing the global 100/min with routes that call MoySklad on each request.
 const CATALOG_RATE_LIMIT = { max: 600, timeWindow: "1 minute" } as const;
+
+// SHOP_BOT_MODE=shared: the shop sends through the main bot (@Comfort_txt_bot),
+// which already tells customers about shipments, payments, supplies and returns
+// itself — the shop's own notices for those documents would arrive twice. Admin
+// alerts and the shop's order messages are not affected.
+const SHARED_MAIN_BOT = process.env.SHOP_BOT_MODE === "shared";
 
 function parseDefaultAddress(addr: string | null): { lat: number; lng: number } | null {
   if (!addr) return null;
@@ -217,6 +225,51 @@ export function registerApiRoutes(server: FastifyInstance) {
     } catch {
       reply.code(502);
       return;
+    }
+  });
+
+  // Registration from the webapp. With SHOP_BOT_MODE=shared the shop never sees
+  // contacts sent in the chat, so the Mini App asks Telegram for the phone number
+  // (WebApp.requestContact) and posts the result here. Telegram signs it with the
+  // bot token, so the number and the account it belongs to can be trusted.
+  server.post("/api/register-contact", async (request, reply) => {
+    const body = (request.body || {}) as { contact?: unknown; language?: unknown };
+    const signed = verifyTelegramSignedData(String(body.contact || ""), process.env.BOT_TOKEN || "", 3600);
+    if (!signed) {
+      reply.code(401);
+      return { error: "invalid_contact" };
+    }
+    let contact: { user_id?: number; phone_number?: string; first_name?: string; last_name?: string } = {};
+    try {
+      contact = JSON.parse(signed.get("contact") || "{}");
+    } catch {
+      // checked below
+    }
+    if (!contact.user_id || !contact.phone_number) {
+      reply.code(400);
+      return { error: "invalid_contact" };
+    }
+    const language = ["uz", "uzc", "ru"].includes(String(body.language)) ? String(body.language) : undefined;
+    try {
+      const result = await registerContact({
+        telegramId: String(contact.user_id),
+        phoneNumber: contact.phone_number,
+        firstName: contact.first_name || null,
+        lastName: contact.last_name || null,
+        language
+      });
+      const name = [contact.first_name, contact.last_name].filter(Boolean).join(" ") || contact.phone_number;
+      await notifyAdminsByType("newUser", (adminLang) => {
+        const header = adminLang === "ru" ? "👤 Новый пользователь" : adminLang === "uzc" ? "👤 Янги фойдаланувчи" : "👤 Yangi foydalanuvchi";
+        const nameLabel = adminLang === "ru" ? "Имя" : adminLang === "uzc" ? "Исм" : "Ism";
+        const phoneLabel = adminLang === "ru" ? "Телефон" : "Telefon";
+        return `${header}\n${nameLabel}: ${name}\n${phoneLabel}: ${contact.phone_number}`;
+      }).catch(() => {});
+      return { ok: true, isNew: result.isNew };
+    } catch (err) {
+      console.error("register-contact failed:", err);
+      reply.code(502);
+      return { error: "registration_failed" };
     }
   });
 
@@ -452,7 +505,7 @@ export function registerApiRoutes(server: FastifyInstance) {
             : lang === "uzc"
               ? "⚠️ Ҳисобингиз тизимдан ўчирилди. Илтимос, /start орқали қайта рўйхатдан ўтинг."
               : "⚠️ Hisobingiz tizimdan o'chirildi. Iltimos, /start orqali qayta ro'yxatdan o'ting.";
-        await sendTelegramMessage(user.telegramId, msg, undefined, true);
+        if (!SHARED_MAIN_BOT) await sendTelegramMessage(user.telegramId, msg, undefined, true);
         continue;
       }
 
@@ -580,7 +633,7 @@ export function registerApiRoutes(server: FastifyInstance) {
           if (dItemLines.length) dMsgParts.push(`📦 ${dItemsLabel}:\n\n${dItemLines.join("\n\n")}`);
           if (totalText) dMsgParts.push(`${dTotalLabel}: ${totalText}`);
           const msg = dMsgParts.join("\n\n") + demandBalanceFooter;
-          await sendTelegramMessage(user.telegramId, msg);
+          if (!SHARED_MAIN_BOT) await sendTelegramMessage(user.telegramId, msg);
 
           // Send PDF receipt (balance already fetched above)
           // Demand creation decreases balance (customer owes more), so balanceBefore = balanceAfter + demandSum
@@ -588,7 +641,7 @@ export function registerApiRoutes(server: FastifyInstance) {
             ? balanceAfterDemand + demandDisplay.amount
             : null;
           const { positions: pdfPositions, leftToPay } = await buildDemandPdfData(demand, demandPositions);
-          generateDemandPdf({
+          if (!SHARED_MAIN_BOT) generateDemandPdf({
             demand: { ...demand, sum: typeof demand.sum === "number" ? demand.sum / 100 : undefined },
             positions: pdfPositions,
             client: { firstName: demand.agent?.name || user.firstName, lastName: null, phoneNumber: user.phoneNumber },
@@ -646,7 +699,7 @@ export function registerApiRoutes(server: FastifyInstance) {
                 ? `🔄 Йетказиб бериш ҳужжати ${demand.name} янгиланди.${detailsText}`
                 : `🔄 Yetkazib berish hujjati ${demand.name} yangilandi.${detailsText}`;
           const pdfBtnLabel = "📄 PDF";
-          await sendTelegramMessageWithKeyboard(user.telegramId, msg, [[{ text: pdfBtnLabel, callback_data: `demand:pdf:${demand.id}` }]]);
+          if (!SHARED_MAIN_BOT) await sendTelegramMessageWithKeyboard(user.telegramId, msg, [[{ text: pdfBtnLabel, callback_data: `demand:pdf:${demand.id}` }]]);
         }
 
         continue;
@@ -704,7 +757,7 @@ export function registerApiRoutes(server: FastifyInstance) {
               : "\n⚠️ Iltimos, to'lovni yakunlang.";
         }
 
-        await sendTelegramMessage(user.telegramId, userMsg);
+        if (!SHARED_MAIN_BOT) await sendTelegramMessage(user.telegramId, userMsg);
 
         await notifyAdminsByType("payment", (adminLang) => {
           const adminTotal = payInDisp !== null ? formatMoneyWithCurrency(payInDisp.amount, payInDisp.currency, adminLang) : "—";
@@ -784,7 +837,7 @@ export function registerApiRoutes(server: FastifyInstance) {
               : "\n⚠️ Iltimos, to'lovni yakunlang.";
         }
 
-        await sendTelegramMessage(user.telegramId, userMsg);
+        if (!SHARED_MAIN_BOT) await sendTelegramMessage(user.telegramId, userMsg);
 
         await notifyAdminsByType("payment", (adminLang) => {
           const adminTotal = payOutDisp !== null ? formatMoneyWithCurrency(payOutDisp.amount, payOutDisp.currency, adminLang) : "—";
@@ -874,7 +927,7 @@ export function registerApiRoutes(server: FastifyInstance) {
         if (totalText) msgParts.push(`${totalLabel}: ${totalText}`);
 
         const msg = msgParts.join("\n\n") + buildBalanceFooter(supplyBalDisp?.amount ?? null, supplyBalDisp?.currency ?? null, lang);
-        await sendTelegramMessage(user.telegramId, msg);
+        if (!SHARED_MAIN_BOT) await sendTelegramMessage(user.telegramId, msg);
 
         await notifyAdminsByType("newOrder", (adminLang) => {
           const adminHeader = adminLang === "ru" ? `📥 Новая поставка: ${supply.name}` : adminLang === "uzc" ? `📥 Янги поставка: ${supply.name}` : `📥 Yangi tovar: ${supply.name}`;
@@ -960,7 +1013,7 @@ export function registerApiRoutes(server: FastifyInstance) {
         if (itemLines.length) msgParts.push(`📦 ${itemsLabel}:\n\n${itemLines.join("\n\n")}`);
 
         const msg = msgParts.join("\n\n") + buildBalanceFooter(balAfterSR?.amount ?? null, balAfterSR?.currency ?? null, lang);
-        await sendTelegramMessage(user.telegramId, msg);
+        if (!SHARED_MAIN_BOT) await sendTelegramMessage(user.telegramId, msg);
 
         await notifyAdminsByType("newOrder", (adminLang) => {
           const adminHeader = adminLang === "ru" ? `↩️ Возврат от покупателя: ${salesReturn.name}` : adminLang === "uzc" ? `↩️ Сотувдан қайтариш ҳужжати яратилди: ${salesReturn.name}` : `↩️ Sotuvdan qaytarish hujjati yaratildi: ${salesReturn.name}`;
