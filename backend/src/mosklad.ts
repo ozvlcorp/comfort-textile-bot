@@ -904,17 +904,61 @@ type DeliveryInfo = {
 };
 
 // ── «Sotuvchi» (seller) on customer orders ────────────────────────────────────
-// Customer orders in this MoySklad account carry a custom employee field
-// «Sotuvchi». Once it was made required, MoySklad refused every shop order
-// without it (412, code 3000: "поле 'Sotuvchi' не может быть пустым"). The shop
-// fills it with the customer's responsible employee — the counterparty owner,
-// which is also who the Telegram bot shows as the seller when the field is
-// empty — or with a fixed employee from MOSKLAD_SELLER_EMPLOYEE_ID.
+// Customer orders in this MoySklad account carry a required custom field
+// «Sotuvchi»; without it MoySklad refuses the order (412, code 3000: "поле
+// 'Sotuvchi' не может быть пустым"). Here it is a dictionary (custom entity),
+// and the owner's rule is that orders from Telegram get «1 Odiy rasxod»
+// (MOSKLAD_SELLER_VALUE overrides it). The other field types are handled too:
+//   • employee — the customer's responsible employee (the counterparty owner,
+//     whom the Telegram bot shows as the seller), or MOSKLAD_SELLER_EMPLOYEE_ID;
+//   • string / text — MOSKLAD_SELLER_VALUE as text.
 // MOSKLAD_SELLER_ATTR_NAME follows a rename of the field in MoySklad.
 const SELLER_ATTR_NAME = (process.env.MOSKLAD_SELLER_ATTR_NAME || "Sotuvchi").trim().toLowerCase();
+const SELLER_VALUE = (process.env.MOSKLAD_SELLER_VALUE || "1 Odiy rasxod").trim();
 
-type AttributeMetadata = { meta?: { href?: string }; name?: string; type?: string };
+type AttributeMetadata = {
+  meta?: { href?: string };
+  name?: string;
+  type?: string;
+  customEntityMeta?: { href?: string };
+};
 let _orderAttributesCache: { rows: AttributeMetadata[]; expiresAt: number } | null = null;
+
+type CustomEntityElement = { meta?: { href?: string }; name?: string };
+const _customEntityCache = new Map<string, { rows: CustomEntityElement[]; expiresAt: number }>();
+
+// Finds a dictionary element by name (case and surrounding spaces ignored).
+// `metadataHref` is the field's customEntityMeta.href, ending in the dictionary id.
+async function findCustomEntityElement(
+  metadataHref: string | undefined,
+  name: string
+): Promise<CustomEntityElement | null> {
+  const dictionaryId = (metadataHref || "").split("/").pop() || "";
+  if (!/^[0-9a-f-]{36}$/i.test(dictionaryId)) {
+    console.warn(`seller field: unexpected dictionary reference ${metadataHref}`);
+    return null;
+  }
+  let rows: CustomEntityElement[];
+  const cached = _customEntityCache.get(dictionaryId);
+  if (cached && cached.expiresAt > Date.now()) {
+    rows = cached.rows;
+  } else {
+    rows = await singleFlight(`customEntity:${dictionaryId}`, async () => {
+      const data = await moskladFetch<{ rows?: CustomEntityElement[] }>(`/entity/customentity/${dictionaryId}?limit=1000`);
+      const list = data.rows ?? [];
+      _customEntityCache.set(dictionaryId, { rows: list, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return list;
+    });
+  }
+  const wanted = name.trim().toLowerCase();
+  const element = rows.find((r) => (r.name || "").trim().toLowerCase() === wanted);
+  if (!element?.meta?.href) {
+    const known = rows.map((r) => r.name).filter(Boolean).slice(0, 30).join(", ");
+    console.warn(`seller field: no «${name}» in the dictionary (has: ${known || "nothing"})`);
+    return null;
+  }
+  return element;
+}
 
 async function getCustomerOrderAttributes(): Promise<AttributeMetadata[]> {
   const now = Date.now();
@@ -939,8 +983,22 @@ async function buildSellerAttribute(counterpartyId: string): Promise<object | nu
   }
   const attrHref = attr?.meta?.href;
   if (!attr || !attrHref) return null;
+  const attrMeta = { href: attrHref, type: "attributemetadata", mediaType: "application/json" };
+
+  if (attr.type === "customentity") {
+    try {
+      const element = await findCustomEntityElement(attr.customEntityMeta?.href, SELLER_VALUE);
+      return element ? { meta: attrMeta, value: { meta: element.meta, name: element.name } } : null;
+    } catch (err) {
+      console.warn(`seller field: could not read the dictionary: ${err instanceof Error ? err.message : err}`);
+      return null;
+    }
+  }
+  if (attr.type === "string" || attr.type === "text") {
+    return SELLER_VALUE ? { meta: attrMeta, value: SELLER_VALUE } : null;
+  }
   if (attr.type !== "employee") {
-    console.warn(`seller field «${attr.name}» has type ${attr.type}; only employee fields are filled automatically`);
+    console.warn(`seller field «${attr.name}» has type ${attr.type}, which is not filled automatically`);
     return null;
   }
 
@@ -961,7 +1019,7 @@ async function buildSellerAttribute(counterpartyId: string): Promise<object | nu
   if (!employeeHref) return null;
 
   return {
-    meta: { href: attrHref, type: "attributemetadata", mediaType: "application/json" },
+    meta: attrMeta,
     value: { meta: { href: employeeHref, type: "employee", mediaType: "application/json" } }
   };
 }
