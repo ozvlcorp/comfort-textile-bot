@@ -903,6 +903,69 @@ type DeliveryInfo = {
   addressExtra?: string | null;
 };
 
+// ── «Sotuvchi» (seller) on customer orders ────────────────────────────────────
+// Customer orders in this MoySklad account carry a custom employee field
+// «Sotuvchi». Once it was made required, MoySklad refused every shop order
+// without it (412, code 3000: "поле 'Sotuvchi' не может быть пустым"). The shop
+// fills it with the customer's responsible employee — the counterparty owner,
+// which is also who the Telegram bot shows as the seller when the field is
+// empty — or with a fixed employee from MOSKLAD_SELLER_EMPLOYEE_ID.
+// MOSKLAD_SELLER_ATTR_NAME follows a rename of the field in MoySklad.
+const SELLER_ATTR_NAME = (process.env.MOSKLAD_SELLER_ATTR_NAME || "Sotuvchi").trim().toLowerCase();
+
+type AttributeMetadata = { meta?: { href?: string }; name?: string; type?: string };
+let _orderAttributesCache: { rows: AttributeMetadata[]; expiresAt: number } | null = null;
+
+async function getCustomerOrderAttributes(): Promise<AttributeMetadata[]> {
+  const now = Date.now();
+  if (_orderAttributesCache && _orderAttributesCache.expiresAt > now) return _orderAttributesCache.rows;
+  return singleFlight("customerOrderAttributes", async () => {
+    const data = await moskladFetch<{ rows?: AttributeMetadata[] }>("/entity/customerorder/metadata/attributes");
+    const rows = data.rows ?? [];
+    _orderAttributesCache = { rows, expiresAt: Date.now() + 10 * 60 * 1000 };
+    return rows;
+  });
+}
+
+async function buildSellerAttribute(counterpartyId: string): Promise<object | null> {
+  let attr: AttributeMetadata | undefined;
+  try {
+    attr = (await getCustomerOrderAttributes()).find(
+      (a) => (a.name || "").trim().toLowerCase() === SELLER_ATTR_NAME
+    );
+  } catch (err) {
+    console.warn(`seller field: could not read customer order fields: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+  const attrHref = attr?.meta?.href;
+  if (!attr || !attrHref) return null;
+  if (attr.type !== "employee") {
+    console.warn(`seller field «${attr.name}» has type ${attr.type}; only employee fields are filled automatically`);
+    return null;
+  }
+
+  let employeeHref: string | undefined;
+  const fixedEmployeeId = (process.env.MOSKLAD_SELLER_EMPLOYEE_ID || "").trim();
+  if (fixedEmployeeId) {
+    employeeHref = `${baseUrl}/entity/employee/${fixedEmployeeId}`;
+  } else {
+    try {
+      const counterparty = await moskladFetch<{ owner?: { meta?: { href?: string } } }>(
+        `/entity/counterparty/${counterpartyId}`
+      );
+      employeeHref = counterparty.owner?.meta?.href;
+    } catch (err) {
+      console.warn(`seller field: could not read the counterparty owner: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  if (!employeeHref) return null;
+
+  return {
+    meta: { href: attrHref, type: "attributemetadata", mediaType: "application/json" },
+    value: { meta: { href: employeeHref, type: "employee", mediaType: "application/json" } }
+  };
+}
+
 export async function createCustomerOrder(
   counterpartyId: string,
   items: OrderItem[],
@@ -1065,6 +1128,9 @@ export async function createCustomerOrder(
       value: deliveryInfo.addressExtra
     });
   }
+  // Required «Sotuvchi» field — see buildSellerAttribute.
+  const sellerAttribute = await buildSellerAttribute(counterpartyId);
+  if (sellerAttribute) orderAttributes.push(sellerAttribute);
   if (orderAttributes.length > 0) orderBody.attributes = orderAttributes;
 
   const data = await moskladFetch<{ id: string; name: string }>(`/entity/customerorder`, {

@@ -336,9 +336,12 @@ export function registerApiRoutes(server: FastifyInstance) {
 
         return { orderName: order.name };
       } catch (err) {
-        // If MoySklad fails, fall through and return draftId
+        // MoySklad refused the order. Answer with an error so the webapp shows
+        // "try again" instead of a false "accepted", and tell the admins why.
         console.error("Failed to create pickup order:", err);
-        return { draftId: draft.id };
+        void alertAdminsOrderFailed(user, draft.id, err);
+        reply.code(502);
+        return { error: "order_failed", draftId: draft.id };
       }
     }
 
@@ -388,8 +391,11 @@ export function registerApiRoutes(server: FastifyInstance) {
 
         return { orderName: order.name };
       } catch (err) {
+        // Same as pickup: a visible error for the customer, the reason for admins.
         console.error("Failed to create delivery order:", err);
-        return { draftId: draft.id };
+        void alertAdminsOrderFailed(user, draft.id, err);
+        reply.code(502);
+        return { error: "order_failed", draftId: draft.id };
       }
     }
 
@@ -2168,6 +2174,35 @@ function fmtMoment(moment?: string): string {
   const hh  = String(d.getHours()).padStart(2, "0");
   const min = String(d.getMinutes()).padStart(2, "0");
   return `${dd}.${mm}.${d.getFullYear()} ${hh}:${min}`;
+}
+
+// A shop order MoySklad refused. Until now the customer was told "accepted" and
+// nobody heard about it; admins now get the reason and the customer's contacts
+// (the draft itself stays in the shop database). Never throws.
+async function alertAdminsOrderFailed(
+  user: { telegramId: string; firstName?: string | null; phoneNumber?: string | null },
+  draftId: string,
+  err: unknown
+): Promise<void> {
+  try {
+    const reason = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").slice(0, 300);
+    const text =
+      `⚠️ Заказ из магазина не создан в МойСкладе.\n` +
+      `Клиент: ${user.firstName || "—"}, ${user.phoneNumber || "—"} (tg ${user.telegramId}).\n` +
+      `Причина: ${reason}\n` +
+      `Черновик сохранён в магазине: ${draftId}.`;
+    const adminIds = (process.env.ADMIN_TELEGRAM_IDS || "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+    for (const adminId of adminIds) {
+      await sendTelegramMessage(adminId, text).catch((e) =>
+        console.warn(`order-failed alert to ${adminId} failed: ${e instanceof Error ? e.message : e}`)
+      );
+    }
+  } catch (e) {
+    console.warn(`order-failed alert error: ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 async function notifyAdminsByType(
