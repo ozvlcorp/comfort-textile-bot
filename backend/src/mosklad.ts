@@ -267,7 +267,8 @@ function singleFlight<T>(key: string, load: () => Promise<T>): Promise<T> {
 }
 
 // ── In-flight dedup + meta caches ────────────────────────────────────────────
-// Stock and products: no TTL cache — always fresh, but deduplicate concurrent requests.
+// Stock: no TTL cache — always fresh, but deduplicate concurrent requests.
+// Products and categories: see «Catalogue cache» below.
 // Currency/org/store: stable meta — cache for 10 min.
 
 let _currencyCache: { code: string | null; expiresAt: number } | null = null;
@@ -276,8 +277,6 @@ let _organizationCache: { id: string | null; expiresAt: number } | null = null;
 let _storeCache: { id: string | null; expiresAt: number } | null = null;
 
 let _stockFetchPromise: Promise<Map<string, number>> | null = null;
-let _productsCache: { data: MoyskladProduct[]; expiresAt: number } | null = null;
-let _productsFetchPromise: Promise<MoyskladProduct[]> | null = null;
 
 async function getStockMap(): Promise<Map<string, number>> {
   if (_stockFetchPromise) return _stockFetchPromise;
@@ -302,22 +301,139 @@ async function getStockMap(): Promise<Map<string, number>> {
 
 // ── Pagination helper ─────────────────────────────────────────────────────────
 
-async function fetchAllPages<T>(basePath: string, maxRows = 10_000): Promise<T[]> {
+type PageOptions = {
+  maxRows?: number;
+  priority?: RequestPriority;
+  // Request the pages after the first one all at once (the scheduler still
+  // keeps them within MoySklad's concurrency and rate limits) instead of one
+  // after another. Rows keep their order; a row repeated across pages because
+  // the list changed mid-load is kept once.
+  parallel?: boolean;
+};
+
+async function fetchAllPages<T>(basePath: string, options: PageOptions = {}): Promise<T[]> {
+  const { maxRows = 10_000, priority, parallel = false } = options;
   const limit = basePath.includes("expand=") ? 100 : 1000;
+  const sep = basePath.includes("?") ? "&" : "?";
+  const page = (offset: number) =>
+    moskladFetch<{ meta: { size: number }; rows: T[] }>(`${basePath}${sep}limit=${limit}&offset=${offset}`, { priority });
+
+  if (parallel) {
+    const first = await page(0);
+    const total = Math.min(first.meta?.size ?? 0, maxRows);
+    const offsets: number[] = [];
+    for (let offset = first.rows.length; first.rows.length > 0 && offset < total; offset += limit) offsets.push(offset);
+    const rest = await Promise.all(offsets.map(page));
+    const seen = new Set<string>();
+    return [first, ...rest]
+      .flatMap((p) => p.rows)
+      .filter((row) => {
+        const id = (row as { id?: unknown }).id;
+        if (typeof id !== "string") return true;
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      })
+      .slice(0, maxRows);
+  }
+
   let offset = 0;
   const allRows: T[] = [];
 
   while (true) {
-    const sep = basePath.includes("?") ? "&" : "?";
-    const data = await moskladFetch<{ meta: { size: number }; rows: T[] }>(
-      `${basePath}${sep}limit=${limit}&offset=${offset}`
-    );
+    const data = await page(offset);
     allRows.push(...data.rows);
     offset += data.rows.length;
     if (data.rows.length === 0 || offset >= (data.meta?.size ?? 0) || allRows.length >= maxRows) break;
   }
 
   return allRows;
+}
+
+// ── Catalogue cache ───────────────────────────────────────────────────────────
+// Every product list in the shop is cut from the full product list, which
+// MoySklad hands out 100 rows per request (expand caps the page size). Loading
+// it while a customer waited made the shop slow to open whenever the copy had
+// expired (hourly) or the server had restarted. Now the catalogue is loaded when
+// the server starts (startCatalogRefresh) and refreshed in the background every
+// CATALOG_REFRESH_MS, and customers get the copy in memory. Someone waits only
+// when there is no copy yet, or it is older than CATALOG_MAX_AGE_MS because the
+// refreshes kept failing — and if that load fails as well, the old copy is used.
+const CATALOG_REFRESH_MS = 30 * 60_000;
+const CATALOG_MAX_AGE_MS = 2 * 60 * 60_000;
+
+const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+type RefreshedCopy<T> = {
+  get(): Promise<T>;
+  // Loads a new copy; without a priority, background once a copy exists.
+  refresh(priority?: RequestPriority): Promise<T>;
+};
+
+function refreshedCopy<T>(name: string, load: (priority: RequestPriority) => Promise<T>): RefreshedCopy<T> {
+  let copy: { value: T; loadedAt: number } | null = null;
+  let loading: Promise<T> | null = null;
+
+  const refresh = (priority?: RequestPriority): Promise<T> => {
+    if (!loading) {
+      loading = load(priority ?? (copy ? "background" : "normal"))
+        .then((value) => {
+          copy = { value, loadedAt: Date.now() };
+          return value;
+        })
+        .finally(() => {
+          loading = null;
+        });
+    }
+    return loading;
+  };
+
+  return {
+    refresh,
+    async get() {
+      const current = copy;
+      if (!current) return refresh("normal");
+      const age = Date.now() - current.loadedAt;
+      if (age > CATALOG_MAX_AGE_MS) {
+        return refresh("normal").catch((err) => {
+          console.warn(`catalog: could not reload ${name}, using the copy from ${Math.round(age / 60_000)} min ago: ${errorText(err)}`);
+          return current.value;
+        });
+      }
+      if (age > CATALOG_REFRESH_MS) {
+        refresh().catch((err) => console.warn(`catalog: refreshing ${name} failed: ${errorText(err)}`));
+      }
+      return current.value;
+    }
+  };
+}
+
+const productsCatalog = refreshedCopy("products", (priority) =>
+  fetchAllPages<MoyskladProduct>("/entity/product?expand=salePrices.currency,productFolder", { priority, parallel: true })
+);
+
+const categoriesCatalog = refreshedCopy("categories", (priority) =>
+  fetchAllPages<{ id: string; name: string }>("/entity/productfolder", { priority, parallel: true })
+);
+
+let _catalogTimer: ReturnType<typeof setInterval> | null = null;
+
+// Loads the catalogue now and keeps it fresh in the background.
+export function startCatalogRefresh(): void {
+  if (_catalogTimer) return;
+  const refreshAll = () => {
+    productsCatalog.refresh().catch((err) => console.warn(`catalog: loading products failed: ${errorText(err)}`));
+    categoriesCatalog.refresh().catch((err) => console.warn(`catalog: loading categories failed: ${errorText(err)}`));
+    getBaseCurrencyCode().catch(() => {});
+  };
+  refreshAll();
+  _catalogTimer = setInterval(refreshAll, CATALOG_REFRESH_MS);
+  _catalogTimer.unref?.();
+}
+
+export function stopCatalogRefresh(): void {
+  if (_catalogTimer) clearInterval(_catalogTimer);
+  _catalogTimer = null;
 }
 
 // ── Products ──────────────────────────────────────────────────────────────────
@@ -357,19 +473,8 @@ function mapProduct(row: MoyskladProduct, stockMap: Map<string, number> | null, 
   };
 }
 
-async function getAllProducts(): Promise<MoyskladProduct[]> {
-  const now = Date.now();
-  if (_productsCache && _productsCache.expiresAt > now) return _productsCache.data;
-  if (_productsFetchPromise) return _productsFetchPromise;
-
-  _productsFetchPromise = fetchAllPages<MoyskladProduct>(
-    "/entity/product?expand=salePrices.currency,productFolder"
-  ).then((data) => {
-    _productsCache = { data, expiresAt: Date.now() + 60 * 60_000 }; // 1 hour
-    return data;
-  }).finally(() => { _productsFetchPromise = null; });
-
-  return _productsFetchPromise;
+function getAllProducts(): Promise<MoyskladProduct[]> {
+  return productsCatalog.get();
 }
 
 export async function listProducts() {
@@ -384,7 +489,7 @@ export async function listProducts() {
 }
 
 export async function listCategories() {
-  const rows = await fetchAllPages<{ id: string; name: string }>("/entity/productfolder");
+  const rows = await categoriesCatalog.get();
   if (rows.length === 0) {
     return [{ id: "all", name: "All products" }];
   }
@@ -667,14 +772,23 @@ export async function getBaseCurrencyCode(): Promise<string | null> {
     return _currencyCache.code;
   }
 
-  return singleFlight("baseCurrency", async () => {
-    const data = await moskladFetch<{
-      currency?: { isoCode?: string; name?: string; symbol?: string };
-    }>("/context/companysettings");
-    const code = data.currency?.isoCode || data.currency?.symbol || data.currency?.name || null;
-    _currencyCache = { code, expiresAt: now + 10 * 60 * 1000 };
-    return code;
-  });
+  const load = () =>
+    singleFlight("baseCurrency", async () => {
+      const data = await moskladFetch<{
+        currency?: { isoCode?: string; name?: string; symbol?: string };
+      }>("/context/companysettings");
+      const code = data.currency?.isoCode || data.currency?.symbol || data.currency?.name || null;
+      _currencyCache = { code, expiresAt: Date.now() + 10 * 60 * 1000 };
+      return code;
+    });
+
+  // Every product list waits for this; the account's currency practically never
+  // changes, so once known it is answered at once and refreshed in the background.
+  if (_currencyCache) {
+    load().catch(() => {});
+    return _currencyCache.code;
+  }
+  return load();
 }
 
 export async function getUsdRate(): Promise<number | null> {
