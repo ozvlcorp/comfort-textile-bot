@@ -17,6 +17,11 @@ const server = Fastify({
   },
   requestTimeout: 30000,
   connectionTimeout: 30000,
+  // Behind Traefik (Dokploy) every connection comes from the proxy, so without
+  // this request.ip was Traefik's address for every visitor and the per-IP rate
+  // limit below was one bucket shared by all customers. 1 = trust exactly one
+  // proxy hop: the client is the address Traefik puts in X-Forwarded-For.
+  trustProxy: 1,
 });
 
 let bot: any = null;
