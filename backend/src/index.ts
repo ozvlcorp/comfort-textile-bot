@@ -8,6 +8,7 @@ import { registerApiRoutes } from "./routes/api.js";
 import { createBot } from "./bot.js";
 import { startReminderWorker, stopReminderWorker } from "./reminders.js";
 import { startReportScheduler, stopReportScheduler } from "./reports.js";
+import { startCatalogRefresh, stopCatalogRefresh } from "./mosklad.js";
 import { prisma } from "./db.js";
 
 const port = Number(process.env.PORT || 4000);
@@ -38,6 +39,9 @@ async function gracefulShutdown(signal: string) {
     // Stop accepting new connections
     await server.close();
     server.log.info("HTTP server closed");
+
+    // Stop the catalogue refresh timer
+    stopCatalogRefresh();
 
     // Stop reminder worker
     stopReminderWorker();
@@ -112,6 +116,10 @@ registerApiRoutes(server);
 try {
   await server.listen({ port, host: "0.0.0.0" });
   server.log.info(`Server listening on http://0.0.0.0:${port}`);
+
+  // Load products and categories now, so the first customer after a restart
+  // doesn't wait for the whole catalogue, and keep them fresh in the background.
+  startCatalogRefresh();
 
   // Signal PM2 that app is ready
   if (process.send) {
