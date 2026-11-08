@@ -449,6 +449,54 @@ input,
   background: var(--pill);
 }
 
+/* Product list pages: ‹ 2 / 5 › */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 4px 0 8px;
+}
+
+.pager-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0.5px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.pager-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.pager-button:not(:disabled):active {
+  transform: scale(0.96);
+  background: var(--pill);
+}
+
+.pager-prev svg {
+  transform: rotate(180deg);
+}
+
+.pager-status {
+  min-width: 64px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .muted {
   color: var(--muted);
   font-size: 13px;

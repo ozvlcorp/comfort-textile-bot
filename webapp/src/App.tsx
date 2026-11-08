@@ -150,6 +150,61 @@ function isOutOfStock(product: Product) {
   return (product.stock ?? 0) <= 0;
 }
 
+// In stock first, then by name — the order of every product list.
+function byStockThenName(a: Product, b: Product) {
+  const stockDelta = Number(isOutOfStock(a)) - Number(isOutOfStock(b));
+  if (stockDelta !== 0) return stockDelta;
+  return a.name.localeCompare(b.name);
+}
+
+// Product lists show PAGE_SIZE products per page.
+const PAGE_SIZE = 100;
+
+function pageCount(total: number) {
+  return Math.max(1, Math.ceil(total / PAGE_SIZE));
+}
+
+function pageSlice<T>(items: T[], page: number) {
+  return items.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+}
+
+function Pager({ page, pages, onChange, prevLabel, nextLabel }: {
+  page: number;
+  pages: number;
+  onChange: (page: number) => void;
+  prevLabel: string;
+  nextLabel: string;
+}) {
+  if (pages <= 1) return null;
+  const go = (target: HTMLElement, next: number) => {
+    onChange(next);
+    // The list scrolls inside its section, not the window.
+    const list = target.closest(".products");
+    if (list) list.scrollTop = 0;
+  };
+  return (
+    <nav className="pager">
+      <button
+        className="pager-button pager-prev"
+        disabled={page <= 1}
+        onClick={(e) => go(e.currentTarget, page - 1)}
+        aria-label={prevLabel}
+      >
+        <HugeiconsIcon icon={ArrowRight01Icon} size={20} color="currentColor" strokeWidth={1.5} />
+      </button>
+      <span className="pager-status">{page} / {pages}</span>
+      <button
+        className="pager-button"
+        disabled={page >= pages}
+        onClick={(e) => go(e.currentTarget, page + 1)}
+        aria-label={nextLabel}
+      >
+        <HugeiconsIcon icon={ArrowRight01Icon} size={20} color="currentColor" strokeWidth={1.5} />
+      </button>
+    </nav>
+  );
+}
+
 const copy = {
   uz: {
     title: "Mahsulotlar",
@@ -182,6 +237,8 @@ const copy = {
     registerHint: "Buyurtma berish uchun telefon raqamingizni yuboring.",
     sharePhone: "📱 Telefon raqamni yuborish",
     registerFailed: "Ro'yxatdan o'tib bo'lmadi. Qayta urinib ko'ring.",
+    prevPage: "Oldingi sahifa",
+    nextPage: "Keyingi sahifa",
     balance: "Balans",
     outOfStock: "Qolmagan",
     allProducts: "Barcha mahsulotlar",
@@ -250,6 +307,8 @@ const copy = {
     registerHint: "Буюртма бериш учун телефон рақамингизни юборинг.",
     sharePhone: "📱 Телефон рақамни юбориш",
     registerFailed: "Рўйхатдан ўтиб бўлмади. Қайта уриниб кўринг.",
+    prevPage: "Олдинги саҳифа",
+    nextPage: "Кейинги саҳифа",
     balance: "Баланс",
     outOfStock: "Қолмаган",
     allProducts: "Барча маҳсулотлар",
@@ -318,6 +377,8 @@ const copy = {
     registerHint: "Чтобы оформлять заказы, отправьте свой номер телефона.",
     sharePhone: "📱 Отправить номер телефона",
     registerFailed: "Не удалось зарегистрироваться. Попробуйте ещё раз.",
+    prevPage: "Предыдущая страница",
+    nextPage: "Следующая страница",
     balance: "Баланс",
     outOfStock: "Нет в наличии",
     allProducts: "Все товары",
@@ -910,6 +971,10 @@ export default function App() {
 
   // New state for tab bar and new views
   const [selectedCatalogCategory, setSelectedCatalogCategory] = useState<Category | null>(null);
+  // Current page of each product list (PAGE_SIZE products per page)
+  const [homePage, setHomePage] = useState(1);
+  const [catalogPage, setCatalogPage] = useState(1);
+  const [savedPage, setSavedPage] = useState(1);
   const [likedIds, setLikedIds] = useState<Set<string>>(new Set());
   const [orders, setOrders] = useState<Order[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
@@ -1208,12 +1273,46 @@ export default function App() {
   const flatFilteredProducts = useMemo(() => {
     if (!searchQuery.trim()) return [];
     const items = filteredCategoriesWithItems.flatMap((cat) => filteredGroupedProducts[cat.id] || []);
-    return items.sort((a, b) => {
-      const stockDelta = Number(isOutOfStock(a)) - Number(isOutOfStock(b));
-      if (stockDelta !== 0) return stockDelta;
-      return a.name.localeCompare(b.name);
+    return items.sort(byStockThenName);
+  }, [searchQuery, filteredCategoriesWithItems, filteredGroupedProducts]);
+
+  // A new search starts from the first page.
+  useEffect(() => { setHomePage(1); }, [searchQuery]);
+
+  // Home without a search: products in category order, paged across categories;
+  // a category split between pages keeps its header (with its full count) on each.
+  const homeEntries = useMemo(() => {
+    if (searchQuery.trim()) return [];
+    return filteredCategoriesWithItems.flatMap((category) => {
+      const sorted = [...(filteredGroupedProducts[category.id] || [])].sort(byStockThenName);
+      return sorted.map((product) => ({ category, product, categoryTotal: sorted.length }));
     });
   }, [searchQuery, filteredCategoriesWithItems, filteredGroupedProducts]);
+
+  const homePages = pageCount(searchQuery.trim() ? flatFilteredProducts.length : homeEntries.length);
+  const homePageSafe = Math.min(homePage, homePages);
+
+  const homeGroups = useMemo(() => {
+    const groups: Array<{ category: Category; total: number; items: Product[] }> = [];
+    for (const entry of pageSlice(homeEntries, homePageSafe)) {
+      const last = groups[groups.length - 1];
+      if (last && last.category.id === entry.category.id) last.items.push(entry.product);
+      else groups.push({ category: entry.category, total: entry.categoryTotal, items: [entry.product] });
+    }
+    return groups;
+  }, [homeEntries, homePageSafe]);
+
+  const searchPageItems = useMemo(
+    () => pageSlice(flatFilteredProducts, homePageSafe),
+    [flatFilteredProducts, homePageSafe]
+  );
+
+  const catalogGroupItems = useMemo(() => {
+    if (!selectedCatalogCategory) return [];
+    return [...(groupedProducts[selectedCatalogCategory.id] || [])].sort(byStockThenName);
+  }, [groupedProducts, selectedCatalogCategory]);
+  const catalogPages = pageCount(catalogGroupItems.length);
+  const catalogPageSafe = Math.min(catalogPage, catalogPages);
 
   const total = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
   const totalCurrency = cart[0]?.priceCurrency;
@@ -1568,6 +1667,8 @@ export default function App() {
   // All products (for saved view)
   const allProducts = useMemo(() => Object.values(groupedProducts).flat(), [groupedProducts]);
   const savedProducts = useMemo(() => allProducts.filter((p) => likedIds.has(p.id)), [allProducts, likedIds]);
+  const savedPages = pageCount(savedProducts.length);
+  const savedPageSafe = Math.min(savedPage, savedPages);
 
   return (
     <div className="app">
@@ -1675,33 +1776,26 @@ export default function App() {
           ) : searchQuery.trim() ? (
             <>
               <div className="category-items">
-                {flatFilteredProducts.map((product) => renderProductCard(product))}
+                {searchPageItems.map((product) => renderProductCard(product))}
               </div>
               {loadingGrouped && <div className="loading-more"><span className="spinner-sm" /></div>}
+              <Pager page={homePageSafe} pages={homePages} onChange={setHomePage} prevLabel={t.prevPage} nextLabel={t.nextPage} />
             </>
           ) : (
             <>
-              {filteredCategoriesWithItems.map((category) => {
-                const items = filteredGroupedProducts[category.id] || [];
-                if (!items.length) return null;
-                const sortedItems = [...items].sort((a, b) => {
-                  const stockDelta = Number(isOutOfStock(a)) - Number(isOutOfStock(b));
-                  if (stockDelta !== 0) return stockDelta;
-                  return a.name.localeCompare(b.name);
-                });
-                return (
-                  <div key={category.id} id={`cat-${category.id}`} className="category-group">
-                    <div className="category-title">
-                      {category.name}
-                      <span className="category-count">{sortedItems.length}</span>
-                    </div>
-                    <div className="category-items">
-                      {sortedItems.map((product) => renderProductCard(product))}
-                    </div>
+              {homeGroups.map(({ category, total, items }) => (
+                <div key={category.id} id={`cat-${category.id}`} className="category-group">
+                  <div className="category-title">
+                    {category.name}
+                    <span className="category-count">{total}</span>
                   </div>
-                );
-              })}
+                  <div className="category-items">
+                    {items.map((product) => renderProductCard(product))}
+                  </div>
+                </div>
+              ))}
               {loadingGrouped && <div className="loading-more"><span className="spinner-sm" /></div>}
+              <Pager page={homePageSafe} pages={homePages} onChange={setHomePage} prevLabel={t.prevPage} nextLabel={t.nextPage} />
             </>
           )}
         </section>
@@ -1720,6 +1814,7 @@ export default function App() {
                   className="catalog-card"
                   onClick={() => {
                     setSelectedCatalogCategory(cat);
+                    setCatalogPage(1);
                     setView("catalog-group");
                   }}
                 >
@@ -1737,27 +1832,19 @@ export default function App() {
       {/* ===== CATALOG GROUP VIEW ===== */}
       {!userInfoLoading && userInfo?.isRegistered && view === "catalog-group" && selectedCatalogCategory && (
         <section className="products has-tabbar">
-          {(() => {
-            const items = groupedProducts[selectedCatalogCategory.id] || [];
-            const sortedItems = [...items].sort((a, b) => {
-              const stockDelta = Number(isOutOfStock(a)) - Number(isOutOfStock(b));
-              if (stockDelta !== 0) return stockDelta;
-              return a.name.localeCompare(b.name);
-            });
-            if (!sortedItems.length) {
-              return (
-                <div className="empty-state">
-                  <HugeiconsIcon icon={InboxIcon} size={48} color="currentColor" strokeWidth={1.5} />
-                  <div className="muted">{t.emptyProducts}</div>
-                </div>
-              );
-            }
-            return (
+          {catalogGroupItems.length === 0 ? (
+            <div className="empty-state">
+              <HugeiconsIcon icon={InboxIcon} size={48} color="currentColor" strokeWidth={1.5} />
+              <div className="muted">{t.emptyProducts}</div>
+            </div>
+          ) : (
+            <>
               <div className="category-items">
-                {sortedItems.map((product) => renderProductCard(product))}
+                {pageSlice(catalogGroupItems, catalogPageSafe).map((product) => renderProductCard(product))}
               </div>
-            );
-          })()}
+              <Pager page={catalogPageSafe} pages={catalogPages} onChange={setCatalogPage} prevLabel={t.prevPage} nextLabel={t.nextPage} />
+            </>
+          )}
         </section>
       )}
 
@@ -1950,9 +2037,12 @@ export default function App() {
               <div className="muted">{t.emptySaved}</div>
             </div>
           ) : (
-            <div className="category-items">
-              {savedProducts.map((product) => renderProductCard(product))}
-            </div>
+            <>
+              <div className="category-items">
+                {pageSlice(savedProducts, savedPageSafe).map((product) => renderProductCard(product))}
+              </div>
+              <Pager page={savedPageSafe} pages={savedPages} onChange={setSavedPage} prevLabel={t.prevPage} nextLabel={t.nextPage} />
+            </>
           )}
         </section>
       )}
