@@ -3,33 +3,128 @@ import { prisma } from "./db.js";
 const baseUrl = process.env.MOSKLAD_BASE_URL || "https://api.moysklad.ru/api/remap/1.2";
 const token = process.env.MOSKLAD_TOKEN || "";
 
-// ── Concurrency limiter ───────────────────────────────────────────────────────
-// MoySklad allows max 5 parallel requests per solution token.
+// ── MoySklad request scheduler ───────────────────────────────────────────────
+// Every call to MoySklad goes through here. It enforces two separate MoySklad
+// rules (dev.moysklad.ru → «Ограничения»), both counted per MoySklad user:
+//   • at most 5 requests in flight at once;
+//   • at most 45 limit UNITS per 3-second window. A request is not one unit:
+//     with login/password (Basic) or user-token auth it costs 2 units from
+//     12.05.2026, 3 from 01.09.2026 and 4 from 01.12.2026 (22 → 15 → 11
+//     requests per 3 s), and /report/stock/all|bystore always costs 5.
+// A request is let through only when both rules allow it, and its cost is
+// booked at that moment — when it actually leaves for MoySklad. Waiting
+// requests go in arrival order, except that "background" ones (product
+// photos) always yield to the rest and never hold more than
+// MAX_BACKGROUND_IN_FLIGHT slots, so a cold image cache after a restart can't
+// hold up a customer's order or profile.
+//
+// Going over the budget returns 429, and more than 200 of those a minute gets
+// the user's API access switched off until MoySklad support restores it.
 
 const MAX_CONCURRENT = 5;
-let _activeRequests = 0;
-const _requestQueue: Array<() => void> = [];
+const MAX_BACKGROUND_IN_FLIGHT = 3;
+const RATE_LIMIT_WINDOW_MS = 3_000;
+const RATE_LIMIT_MAX_UNITS = 45;
+const STOCK_REPORT_WEIGHT = 5;
+// MoySklad counts a request when it arrives, we when it leaves. Hold each one
+// a little longer than the window so network jitter can't make two requests
+// we sent 3 s apart land inside one window on MoySklad's side.
+const RATE_LIMIT_HOLD_MS = RATE_LIMIT_WINDOW_MS + 200;
 
-function acquireSlot(): Promise<void> {
+// Unit cost of an ordinary request with Basic/user-token auth. Each step takes
+// effect at 00:00 Moscow time (UTC+3); newest first.
+const REQUEST_WEIGHT_SCHEDULE: ReadonlyArray<{ from: number; weight: number }> = [
+  { from: Date.UTC(2026, 10, 30, 21), weight: 4 }, // 01.12.2026
+  { from: Date.UTC(2026, 7, 31, 21), weight: 3 }, // 01.09.2026
+  { from: Date.UTC(2026, 4, 11, 21), weight: 2 } // 12.05.2026
+];
+// If MoySklad changes the schedule again, MOSKLAD_REQUEST_WEIGHT=<units> in the
+// service environment replaces it for ordinary requests (redeploy, no code change).
+const REQUEST_WEIGHT_OVERRIDE = Number(process.env.MOSKLAD_REQUEST_WEIGHT || "");
+
+function requestWeight(path: string, now: number = Date.now()): number {
+  if (path.startsWith("/report/stock/all") || path.startsWith("/report/stock/bystore")) {
+    return STOCK_REPORT_WEIGHT;
+  }
+  if (Number.isInteger(REQUEST_WEIGHT_OVERRIDE) && REQUEST_WEIGHT_OVERRIDE >= 1) {
+    return Math.min(REQUEST_WEIGHT_OVERRIDE, RATE_LIMIT_MAX_UNITS);
+  }
+  for (const step of REQUEST_WEIGHT_SCHEDULE) {
+    if (now >= step.from) return step.weight;
+  }
+  return 1;
+}
+
+type RequestPriority = "normal" | "background";
+type Waiter = { weight: number; resolve: () => void };
+
+const _waiting: Record<RequestPriority, Waiter[]> = { normal: [], background: [] };
+const _sent: Array<{ at: number; weight: number }> = []; // requests sent within the window
+let _sentUnits = 0;
+let _inFlight = 0;
+let _backgroundInFlight = 0;
+let _pausedUntil = 0;
+let _wakeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function acquireSlot(weight: number, priority: RequestPriority): Promise<void> {
   return new Promise((resolve) => {
-    if (_activeRequests < MAX_CONCURRENT) {
-      _activeRequests++;
-      resolve();
-    } else {
-      _requestQueue.push(() => { _activeRequests++; resolve(); });
-    }
+    _waiting[priority].push({ weight: Math.max(1, Math.min(weight, RATE_LIMIT_MAX_UNITS)), resolve });
+    dispatchWaiting();
   });
 }
 
-function releaseSlot(): void {
-  _activeRequests--;
-  const next = _requestQueue.shift();
-  if (next) next();
+function releaseSlot(priority: RequestPriority): void {
+  _inFlight--;
+  if (priority === "background") _backgroundInFlight--;
+  dispatchWaiting();
+}
+
+// A 429 says how long MoySklad wants us to back off. The limit is per MoySklad
+// user, so hold back every request, not only the one that was refused.
+function pauseRequests(ms: number): void {
+  _pausedUntil = Math.max(_pausedUntil, Date.now() + ms);
+}
+
+function dispatchWaiting(): void {
+  if (_wakeTimer) {
+    clearTimeout(_wakeTimer);
+    _wakeTimer = null;
+  }
+  while (_inFlight < MAX_CONCURRENT) {
+    const priority: RequestPriority = _waiting.normal.length > 0 ? "normal" : "background";
+    const queue = _waiting[priority];
+    const next = queue[0];
+    if (!next) return;
+    if (priority === "background" && _backgroundInFlight >= MAX_BACKGROUND_IN_FLIGHT) return;
+
+    const now = Date.now();
+    while (_sent.length > 0 && _sent[0].at + RATE_LIMIT_HOLD_MS <= now) {
+      _sentUnits -= _sent.shift()!.weight;
+    }
+    let waitMs = 0;
+    if (_pausedUntil > now) {
+      waitMs = _pausedUntil - now;
+    } else if (_sentUnits + next.weight > RATE_LIMIT_MAX_UNITS && _sent.length > 0) {
+      waitMs = _sent[0].at + RATE_LIMIT_HOLD_MS - now;
+    }
+    if (waitMs > 0) {
+      _wakeTimer = setTimeout(dispatchWaiting, waitMs);
+      return;
+    }
+
+    queue.shift();
+    _sent.push({ at: now, weight: next.weight });
+    _sentUnits += next.weight;
+    _inFlight++;
+    if (priority === "background") _backgroundInFlight++;
+    next.resolve();
+  }
 }
 
 type FetchOptions = {
   method?: string;
   body?: unknown;
+  priority?: RequestPriority;
 };
 
 function isTransientError(err: unknown): boolean {
@@ -38,48 +133,137 @@ function isTransientError(err: unknown): boolean {
   return msg.includes("EAI_AGAIN") || msg.includes("ECONNRESET") || msg.includes("ETIMEDOUT") || msg.includes("ECONNREFUSED") || msg.includes("fetch failed");
 }
 
-const FETCH_TIMEOUT_MS = 30_000;
+// Non-2xx answer from MoySklad. The message keeps the format callers already
+// match on: "Mosklad request failed: <status> <body>".
+class MoskladHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, body: string) {
+    super(`Mosklad request failed: ${status} ${body}`);
+    this.status = status;
+  }
+}
 
-async function moskladFetch<T>(path: string, options: FetchOptions = {}): Promise<T> {
+const FETCH_TIMEOUT_MS = 30_000;
+// A 429 means "slow down", not "failed": wait as long as MoySklad asks, up to
+// this many times per call, without using up the retries meant for network errors.
+const MAX_RATE_LIMIT_WAITS = 6;
+
+function rateLimitWaitMs(response: Response, waits: number): number {
+  // X-Lognex-Retry-After: milliseconds until MoySklad accepts requests again.
+  const header = Number(response.headers.get("X-Lognex-Retry-After"));
+  if (Number.isFinite(header) && header > 0) return Math.min(header, 30_000);
+  return Math.min(1_000 * waits, 10_000);
+}
+
+async function moskladRequest<T>(
+  path: string,
+  init: { method?: string; headers: Record<string, string>; body?: string },
+  priority: RequestPriority,
+  read: (response: Response) => Promise<T>
+): Promise<T> {
   if (!token) {
     throw new Error("MOSKLAD_TOKEN is not set");
   }
+  const method = init.method || "GET";
+  const weight = requestWeight(path);
   const MAX_RETRIES = 3;
   let lastError: unknown;
+  let rateLimitWaits = 0;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       await new Promise((r) => setTimeout(r, 500 * attempt));
     }
-    await acquireSlot();
+    await acquireSlot(weight, priority);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let rateLimited = false;
     try {
       const response = await fetch(`${baseUrl}${path}`, {
         signal: controller.signal,
-        method: options.method || "GET",
-        headers: {
-          Authorization: `Basic ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: options.body ? JSON.stringify(options.body) : undefined
+        method,
+        headers: init.headers,
+        body: init.body
       });
 
-      if (!response.ok) {
+      if (response.status === 429 && rateLimitWaits < MAX_RATE_LIMIT_WAITS) {
+        rateLimitWaits++;
+        const waitMs = rateLimitWaitMs(response, rateLimitWaits);
+        await response.text().catch(() => "");
+        pauseRequests(waitMs);
+        console.warn(`moskladFetch 429 (wait ${rateLimitWaits}/${MAX_RATE_LIMIT_WAITS}): ${method} ${path.split("?")[0]} — holding all MoySklad calls for ${waitMs}ms`);
+        rateLimited = true;
+      } else if (!response.ok) {
         const text = await response.text();
-        throw new Error(`Mosklad request failed: ${response.status} ${text}`);
+        throw new MoskladHttpError(response.status, text);
+      } else {
+        return await read(response);
       }
-
-      return (await response.json()) as T;
     } catch (err) {
       lastError = err;
       if (!isTransientError(err)) throw err;
       console.warn(`moskladFetch transient error (attempt ${attempt + 1}/${MAX_RETRIES}): ${err instanceof Error ? err.message : err}`);
     } finally {
       clearTimeout(timeoutId);
-      releaseSlot();
+      releaseSlot(priority);
     }
+    // Waiting out a 429 doesn't use up one of the network-error retries.
+    if (rateLimited) attempt--;
   }
   throw lastError;
+}
+
+async function moskladFetch<T>(path: string, options: FetchOptions = {}): Promise<T> {
+  return moskladRequest(
+    path,
+    {
+      method: options.method || "GET",
+      headers: {
+        Authorization: `Basic ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    },
+    options.priority || "normal",
+    async (response) => (await response.json()) as T
+  );
+}
+
+// Product photos come from MoySklad's /download endpoint, which spends the same
+// per-user budget as JSON calls — so they go through the scheduler too, at
+// background priority. Returns null when MoySklad answers with an error status
+// (e.g. 404 for a removed photo); network failures still throw.
+export async function downloadMoskladFile(
+  path: string
+): Promise<{ buf: Buffer; contentType: string } | null> {
+  try {
+    return await moskladRequest(
+      path,
+      { headers: { Authorization: `Basic ${token}` } },
+      "background",
+      async (response) => ({
+        buf: Buffer.from(await response.arrayBuffer()),
+        contentType: response.headers.get("content-type") || "image/jpeg"
+      })
+    );
+  } catch (err) {
+    if (err instanceof MoskladHttpError) return null;
+    throw err;
+  }
+}
+
+// Concurrent callers of the same lookup share one MoySklad request instead of
+// each sending their own while the cache is cold (opening the shop fires ~27
+// category requests at once, and each used to fetch the currency separately).
+const _pendingLookups = new Map<string, Promise<unknown>>();
+
+function singleFlight<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const pending = _pendingLookups.get(key);
+  if (pending) return pending as Promise<T>;
+  const promise = load().finally(() => {
+    _pendingLookups.delete(key);
+  });
+  _pendingLookups.set(key, promise);
+  return promise;
 }
 
 // ── In-flight dedup + meta caches ────────────────────────────────────────────
@@ -234,7 +418,7 @@ export async function getProductsByIds(ids: string[]) {
 export async function fetchProductImages(productId: string): Promise<Array<{ id: string; url: string }>> {
   const data = await moskladFetch<{
     rows: Array<{ meta: { href: string }; id?: string }>;
-  }>(`/entity/product/${productId}/images?limit=10`);
+  }>(`/entity/product/${productId}/images?limit=10`, { priority: "background" });
 
   return data.rows.map((row) => {
     const parts = row.meta.href.split("/");
@@ -483,33 +667,37 @@ export async function getBaseCurrencyCode(): Promise<string | null> {
     return _currencyCache.code;
   }
 
-  const data = await moskladFetch<{
-    currency?: { isoCode?: string; name?: string; symbol?: string };
-  }>("/context/companysettings");
-  const code = data.currency?.isoCode || data.currency?.symbol || data.currency?.name || null;
-  _currencyCache = { code, expiresAt: now + 10 * 60 * 1000 };
-  return code;
+  return singleFlight("baseCurrency", async () => {
+    const data = await moskladFetch<{
+      currency?: { isoCode?: string; name?: string; symbol?: string };
+    }>("/context/companysettings");
+    const code = data.currency?.isoCode || data.currency?.symbol || data.currency?.name || null;
+    _currencyCache = { code, expiresAt: now + 10 * 60 * 1000 };
+    return code;
+  });
 }
 
 export async function getUsdRate(): Promise<number | null> {
   const now = Date.now();
   if (_usdRateCache && _usdRateCache.expiresAt > now) return _usdRateCache.rate;
 
-  const data = await moskladFetch<{
-    rows: Array<{ isoCode: string; rate: number; multiplicity: number }>;
-  }>("/entity/currency?limit=50");
-  const usd = data.rows.find((c) => c.isoCode === "USD");
-  let rate: number | null = null;
-  if (usd && usd.rate > 0) {
-    // rate = UZS per `multiplicity` units of USD → UZS per 1 USD
-    rate = usd.rate / (usd.multiplicity || 1);
-  } else {
-    // USD not configured in MoySklad or rate=0 — try env fallback
-    const envRate = parseFloat(process.env.FALLBACK_USD_RATE ?? "");
-    if (!isNaN(envRate) && envRate > 0) rate = envRate;
-  }
-  _usdRateCache = { rate, expiresAt: now + 10 * 60 * 1000 };
-  return rate;
+  return singleFlight("usdRate", async () => {
+    const data = await moskladFetch<{
+      rows: Array<{ isoCode: string; rate: number; multiplicity: number }>;
+    }>("/entity/currency?limit=50");
+    const usd = data.rows.find((c) => c.isoCode === "USD");
+    let rate: number | null = null;
+    if (usd && usd.rate > 0) {
+      // rate = UZS per `multiplicity` units of USD → UZS per 1 USD
+      rate = usd.rate / (usd.multiplicity || 1);
+    } else {
+      // USD not configured in MoySklad or rate=0 — try env fallback
+      const envRate = parseFloat(process.env.FALLBACK_USD_RATE ?? "");
+      if (!isNaN(envRate) && envRate > 0) rate = envRate;
+    }
+    _usdRateCache = { rate, expiresAt: now + 10 * 60 * 1000 };
+    return rate;
+  });
 }
 
 // Shop orders are created in UZS (like manually created orders). Returns the UZS
@@ -523,24 +711,26 @@ export async function getUzsCurrencyInfo(): Promise<{ href: string; uzsPerUsd: n
   if (_uzsCurrencyCache && _uzsCurrencyCache.expiresAt > now) {
     return { href: _uzsCurrencyCache.href, uzsPerUsd: _uzsCurrencyCache.uzsPerUsd };
   }
-  try {
-    const data = await moskladFetch<{
-      rows: Array<{ meta: { href: string }; isoCode?: string; name?: string; rate: number; multiplicity?: number }>;
-    }>("/entity/currency?limit=50");
-    const uzsRow = data.rows.find(
-      (c) => (c.isoCode || "").toUpperCase() === "UZS" || (c.name || "").toLowerCase().includes("сум")
-    );
-    if (!uzsRow?.meta?.href || !uzsRow.rate || uzsRow.rate <= 0) return null;
-    // The directory stores the rate either as UZS-per-USD (12 070, "обратный курс")
-    // or as USD-per-UZS (0.0000828) — disambiguate by magnitude.
-    const k = uzsRow.rate / (uzsRow.multiplicity || 1);
-    const uzsPerUsd = k > 1 ? k : 1 / k;
-    if (!isFinite(uzsPerUsd) || uzsPerUsd < 1000 || uzsPerUsd > 1000000) return null;
-    _uzsCurrencyCache = { href: uzsRow.meta.href, uzsPerUsd, expiresAt: now + 60 * 1000 };
-    return { href: uzsRow.meta.href, uzsPerUsd };
-  } catch {
-    return null;
-  }
+  return singleFlight("uzsCurrency", async () => {
+    try {
+      const data = await moskladFetch<{
+        rows: Array<{ meta: { href: string }; isoCode?: string; name?: string; rate: number; multiplicity?: number }>;
+      }>("/entity/currency?limit=50");
+      const uzsRow = data.rows.find(
+        (c) => (c.isoCode || "").toUpperCase() === "UZS" || (c.name || "").toLowerCase().includes("сум")
+      );
+      if (!uzsRow?.meta?.href || !uzsRow.rate || uzsRow.rate <= 0) return null;
+      // The directory stores the rate either as UZS-per-USD (12 070, "обратный курс")
+      // or as USD-per-UZS (0.0000828) — disambiguate by magnitude.
+      const k = uzsRow.rate / (uzsRow.multiplicity || 1);
+      const uzsPerUsd = k > 1 ? k : 1 / k;
+      if (!isFinite(uzsPerUsd) || uzsPerUsd < 1000 || uzsPerUsd > 1000000) return null;
+      _uzsCurrencyCache = { href: uzsRow.meta.href, uzsPerUsd, expiresAt: now + 60 * 1000 };
+      return { href: uzsRow.meta.href, uzsPerUsd };
+    } catch {
+      return null;
+    }
+  });
 }
 
 // Maps a MoySklad currency id (the last path segment of its meta.href) to its ISO
@@ -553,21 +743,23 @@ export async function getCurrencyIsoMap(): Promise<Record<string, string>> {
   if (_currencyIsoMapCache && _currencyIsoMapCache.expiresAt > now) {
     return _currencyIsoMapCache.map;
   }
-  const map: Record<string, string> = {};
-  try {
-    const data = await moskladFetch<{
-      rows: Array<{ id?: string; meta?: { href?: string }; isoCode?: string; name?: string }>;
-    }>("/entity/currency?limit=100");
-    for (const c of data.rows) {
-      const iso = c.isoCode || c.name;
-      const id = c.id || (c.meta?.href ? c.meta.href.split("/").pop() : undefined);
-      if (id && iso) map[id] = iso;
+  return singleFlight("currencyIsoMap", async () => {
+    const map: Record<string, string> = {};
+    try {
+      const data = await moskladFetch<{
+        rows: Array<{ id?: string; meta?: { href?: string }; isoCode?: string; name?: string }>;
+      }>("/entity/currency?limit=100");
+      for (const c of data.rows) {
+        const iso = c.isoCode || c.name;
+        const id = c.id || (c.meta?.href ? c.meta.href.split("/").pop() : undefined);
+        if (id && iso) map[id] = iso;
+      }
+    } catch {
+      // Leave the map empty; callers fall back to null.
     }
-  } catch {
-    // Leave the map empty; callers fall back to null.
-  }
-  _currencyIsoMapCache = { map, expiresAt: now + 5 * 60 * 1000 };
-  return map;
+    _currencyIsoMapCache = { map, expiresAt: now + 5 * 60 * 1000 };
+    return map;
+  });
 }
 
 // Resolves a currency reference href (e.g. ".../entity/currency/<id>") to its ISO code.

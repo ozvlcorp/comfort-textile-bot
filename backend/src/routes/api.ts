@@ -9,6 +9,7 @@ import {
   getOrCreateCounterparty,
   createCustomerOrder,
   fetchProductImages,
+  downloadMoskladFile,
   getCustomerBalance,
   getBaseCurrencyCode,
   listCustomerOrders,
@@ -42,6 +43,19 @@ const MAX_IMAGE_LIST_CACHE = 500;
 const MAX_IMAGE_BINARY_CACHE = 300;
 const imageBinaryCache = new Map<string, { buf: Buffer; contentType: string }>();
 
+// MoySklad ids are UUIDs. The image routes put ids from the URL into a MoySklad
+// request path, so anything else (e.g. "..%2Fentity%2Fcounterparty") is refused
+// before it can reach another MoySklad endpoint with the shop's credentials.
+const MOSKLAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isMoskladId(value: string): boolean {
+  return MOSKLAD_ID_RE.test(value);
+}
+
+// Opening the shop requests every category at once (~30 calls per visit), so
+// these cached, read-only routes get their own per-client budget instead of
+// sharing the global 100/min with routes that call MoySklad on each request.
+const CATALOG_RATE_LIMIT = { max: 600, timeWindow: "1 minute" } as const;
+
 function parseDefaultAddress(addr: string | null): { lat: number; lng: number } | null {
   if (!addr) return null;
   const match = addr.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
@@ -53,7 +67,7 @@ function parseDefaultAddress(addr: string | null): { lat: number; lng: number } 
 }
 
 export function registerApiRoutes(server: FastifyInstance) {
-  server.get("/api/categories", async () => {
+  server.get("/api/categories", { config: { rateLimit: { ...CATALOG_RATE_LIMIT } } }, async () => {
     const cacheKey = "categories";
     const cached = cache.get(cacheKey);
     if (cached) return cached;
@@ -134,7 +148,7 @@ export function registerApiRoutes(server: FastifyInstance) {
     }
   });
 
-  server.get("/api/products", async (request) => {
+  server.get("/api/products", { config: { rateLimit: { ...CATALOG_RATE_LIMIT } } }, async (request) => {
     const query = request.query as { categoryId?: string };
     const cacheKey = query.categoryId ? `products:${query.categoryId}` : "products:all";
 
@@ -151,6 +165,10 @@ export function registerApiRoutes(server: FastifyInstance) {
 
   server.get("/api/products/:productId/images", { config: { rateLimit: false } }, async (request, reply) => {
     const { productId } = request.params as { productId: string };
+    if (!isMoskladId(productId)) {
+      reply.code(404);
+      return [];
+    }
     const cached = imageListCache.get(productId);
     if (cached) return cached;
     try {
@@ -169,27 +187,25 @@ export function registerApiRoutes(server: FastifyInstance) {
 
   server.get("/api/product-image/:productId/:imageId", { config: { rateLimit: false } }, async (request, reply) => {
     const { imageId } = request.params as { productId: string; imageId: string };
+    if (!isMoskladId(imageId)) {
+      reply.code(404);
+      return;
+    }
     const cached = imageBinaryCache.get(imageId);
     if (cached) {
       reply.header("content-type", cached.contentType);
       reply.header("cache-control", "public, max-age=31536000, immutable");
       return reply.send(cached.buf);
     }
-    const moskladToken = process.env.MOSKLAD_TOKEN;
-    const base = process.env.MOSKLAD_BASE_URL || "https://api.moysklad.ru/api/remap/1.2";
     try {
-      const imgController = new AbortController();
-      const imgTimeout = setTimeout(() => imgController.abort(), 30_000);
-      const response = await fetch(
-        `${base}/download/${imageId}`,
-        { signal: imgController.signal, headers: { Authorization: `Basic ${moskladToken}` } }
-      ).finally(() => clearTimeout(imgTimeout));
-      if (!response.ok) {
+      // Through the shared MoySklad scheduler (rate + concurrency limits), not a
+      // bare fetch: /download spends the same per-user API budget as JSON calls.
+      const image = await downloadMoskladFile(`/download/${imageId}`);
+      if (!image) {
         reply.code(404);
         return;
       }
-      const contentType = response.headers.get("content-type") || "image/jpeg";
-      const buf = Buffer.from(await response.arrayBuffer());
+      const { buf, contentType } = image;
       if (imageBinaryCache.size >= MAX_IMAGE_BINARY_CACHE) {
         const firstKey = imageBinaryCache.keys().next().value;
         if (firstKey) imageBinaryCache.delete(firstKey);
